@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MiAir</title>
+    <style>
+        :root {
+            --bg: #0f0f11;
+            --surface: #1a1a1f;
+            --surface-hover: #222228;
+            --border: rgba(255,255,255,0.06);
+            --border-active: rgba(99,140,255,0.4);
+            --text: #e8e8ec;
+            --text-secondary: #8b8b96;
+            --text-muted: #5c5c66;
+            --accent: #638cff;
+            --accent-dim: rgba(99,140,255,0.12);
+            --green: #34d399;
+            --green-dim: rgba(52,211,153,0.12);
+            --yellow: #fbbf24;
+            --yellow-dim: rgba(251,191,36,0.12);
+            --red: #f87171;
+            --red-dim: rgba(248,113,113,0.12);
+            --radius: 12px;
+            --radius-sm: 8px;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "SF Pro Display", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            -webkit-font-smoothing: antialiased;
+        }
+        .container { max-width: 1100px; margin: 0 auto; padding: 32px 20px 48px; }
+        .main-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        @media (max-width: 768px) { .main-grid { grid-template-columns: 1fr; } }
+
+        /* Header */
+        .header { text-align: center; margin-bottom: 32px; }
+        .logo {
+            font-size: 28px; font-weight: 700; letter-spacing: -0.5px;
+            background: linear-gradient(135deg, #638cff, #a78bfa);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .tagline { color: var(--text-muted); font-size: 13px; margin-top: 4px; }
+
+        /* Status Bar */
+        .status-bar {
+            display: flex; align-items: center; gap: 10px;
+            padding: 12px 16px; border-radius: var(--radius);
+            margin-bottom: 20px; font-size: 13px; font-weight: 500;
+            border: 1px solid var(--border);
+            transition: all 0.3s ease;
+        }
+        .status-running { background: var(--green-dim); border-color: rgba(52,211,153,0.2); color: var(--green); }
+        .status-stopped { background: var(--yellow-dim); border-color: rgba(251,191,36,0.15); color: var(--yellow); }
+        .status-dot {
+            width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+        }
+        .dot-green { background: var(--green); box-shadow: 0 0 8px rgba(52,211,153,0.5); }
+        .dot-yellow { background: var(--yellow); box-shadow: 0 0 8px rgba(251,191,36,0.4); }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .status-running .dot-green { animation: pulse 2s ease-in-out infinite; }
+
+        /* Cards */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            margin-bottom: 16px;
+            transition: border-color 0.2s;
+        }
+        .card:hover { border-color: rgba(255,255,255,0.1); }
+        .card-header {
+            margin-bottom: 18px; padding-bottom: 14px;
+            border-bottom: 1px solid var(--border);
+        }
+        .card-title { font-size: 15px; font-weight: 600; }
+
+        /* Form */
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block; font-size: 12px; color: var(--text-secondary);
+            margin-bottom: 6px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        .form-input {
+            width: 100%; padding: 10px 14px;
+            background: var(--bg); border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text); font-size: 14px;
+            transition: all 0.2s;
+            outline: none;
+        }
+        .form-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+        .form-input::placeholder { color: var(--text-muted); }
+
+        /* Buttons */
+        .btn {
+            padding: 10px 20px; border: none; border-radius: var(--radius-sm);
+            font-size: 13px; font-weight: 600; cursor: pointer;
+            transition: all 0.2s; outline: none; letter-spacing: 0.2px;
+        }
+        .btn-primary {
+            background: var(--accent); color: #fff;
+            box-shadow: 0 2px 8px rgba(99,140,255,0.25);
+        }
+        .btn-primary:hover { background: #5278e8; box-shadow: 0 4px 12px rgba(99,140,255,0.35); transform: translateY(-1px); }
+        .btn-primary:active { transform: translateY(0); }
+        .btn-primary:disabled { background: #3a3a44; color: #666; box-shadow: none; cursor: not-allowed; transform: none; }
+        .btn-success {
+            background: var(--green); color: #0f0f11;
+            box-shadow: 0 2px 8px rgba(52,211,153,0.25);
+        }
+        .btn-success:hover { background: #2bc48c; box-shadow: 0 4px 12px rgba(52,211,153,0.35); transform: translateY(-1px); }
+        .btn-success:active { transform: translateY(0); }
+        .btn-success:disabled { background: #3a3a44; color: #666; box-shadow: none; cursor: not-allowed; transform: none; }
+        .btn-row { display: flex; gap: 8px; margin-top: 16px; }
+
+        /* Tips */
+        .tip { font-size: 12px; color: var(--text-muted); margin-top: 10px; line-height: 1.6; }
+        .tip.error { color: var(--red); }
+        .tip.success { color: var(--green); }
+        .tip code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 11px; color: var(--text-secondary); }
+
+        /* Device List */
+        .device-list { margin-top: 12px; }
+        .device-item {
+            display: flex; align-items: center;
+            padding: 12px 14px; border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            margin-bottom: 8px; cursor: pointer;
+            transition: all 0.2s; background: var(--bg);
+        }
+        .device-item:hover { border-color: rgba(255,255,255,0.12); background: var(--surface-hover); }
+        .device-item.selected { border-color: var(--border-active); background: var(--accent-dim); }
+        .device-item input[type="checkbox"] {
+            appearance: none; -webkit-appearance: none;
+            width: 18px; height: 18px; border: 2px solid var(--text-muted);
+            border-radius: 4px; margin-right: 12px; cursor: pointer;
+            transition: all 0.15s; flex-shrink: 0; position: relative;
+        }
+        .device-item input[type="checkbox"]:checked {
+            background: var(--accent); border-color: var(--accent);
+        }
+        .device-item input[type="checkbox"]:checked::after {
+            content: '✓'; position: absolute;
+            top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #fff; font-size: 12px; font-weight: 700;
+        }
+        .device-image {
+            width: 44px; height: 44px; margin-right: 12px;
+            border-radius: var(--radius-sm);
+            background-size: cover; background-position: center;
+            background-color: var(--surface-hover); flex-shrink: 0;
+        }
+        .device-info { flex: 1; min-width: 0; }
+        .device-name-input {
+            border: 1px solid transparent; padding: 2px 6px;
+            border-radius: 4px; font-size: 14px; font-weight: 500;
+            background: transparent; width: 100%; color: var(--text);
+            transition: all 0.2s; outline: none;
+        }
+        .device-name-input:hover { background: var(--surface-hover); border-color: var(--border); }
+        .device-name-input:focus { background: var(--bg); border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
+        .device-meta { font-size: 11px; color: var(--text-muted); margin-top: 2px; padding-left: 6px; }
+
+        /* Renderers / Speaker Cards */
+        .speaker-card {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 14px 16px; border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            margin-bottom: 8px; background: var(--bg);
+            transition: all 0.2s;
+        }
+        .speaker-card:hover { border-color: rgba(255,255,255,0.1); }
+        .speaker-left { min-width: 0; flex: 1; }
+        .speaker-name { font-size: 14px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
+        .speaker-source { font-size: 11px; color: var(--text-muted); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .badge {
+            font-size: 10px; font-weight: 600; padding: 2px 6px;
+            border-radius: 4px; letter-spacing: 0.3px;
+        }
+        .badge-airplay { background: rgba(168,139,250,0.15); color: #a78bfa; }
+        .badge-dlna { background: var(--accent-dim); color: var(--accent); }
+        .speaker-state {
+            font-size: 12px; font-weight: 500; padding: 4px 10px;
+            border-radius: 6px; white-space: nowrap;
+            background: rgba(255,255,255,0.04); color: var(--text-muted);
+        }
+        .speaker-state.playing { background: var(--green-dim); color: var(--green); }
+
+        /* Toggle Switch */
+        .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 4px 0; }
+        .toggle-label { font-size: 14px; font-weight: 500; }
+        .toggle-desc { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+        .toggle {
+            position: relative; width: 44px; height: 24px; flex-shrink: 0;
+        }
+        .toggle input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider {
+            position: absolute; cursor: pointer; inset: 0;
+            background: #3a3a44; border-radius: 12px;
+            transition: background 0.3s;
+        }
+        .toggle-slider::before {
+            content: ''; position: absolute;
+            width: 18px; height: 18px; left: 3px; bottom: 3px;
+            background: #fff; border-radius: 50%;
+            transition: transform 0.3s;
+        }
+        .toggle input:checked + .toggle-slider { background: var(--accent); }
+        .toggle input:checked + .toggle-slider::before { transform: translateX(20px); }
+
+        /* Loading */
+        .loading { text-align: center; padding: 24px; color: var(--text-muted); font-size: 13px; }
+
+        /* Number input */
+        .input-number {
+            width: 80px; padding: 8px 12px; text-align: center;
+            background: var(--bg); border: 1px solid var(--border);
+            border-radius: var(--radius-sm); color: var(--text);
+            font-size: 14px; outline: none; transition: all 0.2s;
+        }
+        .input-number:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+
+        .delay-row { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+        .delay-label { font-size: 13px; color: var(--text-secondary); }
+        .delay-unit { font-size: 13px; color: var(--text-muted); }
+
+        /* Footer */
+        .footer { text-align: center; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
+        .footer-text { font-size: 11px; color: var(--text-muted); }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <div class="logo">MiAir</div>
+        <div class="tagline">为小爱音箱添加 DLNA / AirPlay 投送支持</div>
+    </div>
+
+    <!-- 状态栏 -->
+    <div id="status-bar" class="status-bar status-stopped">
+        <span class="status-dot dot-yellow"></span>
+        <span id="status-text">加载中...</span>
+    </div>
+
+    <div class="main-grid">
+        <!-- 左侧：设置 -->
+        <div class="col-left">
+            <div class="card" id="card-account">
+                <div class="card-header">
+                    <span class="card-title">小米账号</span>
+                </div>
+                <div class="form-group">
+                    <label for="input-userId">userId</label>
+                    <input type="text" class="form-input" id="input-userId" placeholder="从浏览器 Cookie 中提取 userId 的值">
+                </div>
+                <div class="form-group">
+                    <label for="input-passToken">passToken</label>
+                    <input type="password" class="form-input" id="input-passToken" placeholder="从浏览器 Cookie 中提取 passToken 的值">
+                </div>
+                <p class="tip">
+                    登录 <code>account.xiaomi.com</code> → F12 开发者工具 → Application → Cookies → 复制 <code>userId</code> 和 <code>passToken</code>
+                </p>
+                <div class="btn-row">
+                    <button class="btn btn-primary" id="btn-fetch-devices">登录小米账号</button>
+                </div>
+                <p class="tip" id="tip-account"></p>
+            </div>
+
+            <div class="card" id="card-experimental">
+                <div class="card-header">
+                    <span class="card-title">实验性功能</span>
+                </div>
+                <div class="toggle-row">
+                    <div>
+                        <div class="toggle-label">打断后续播</div>
+                        <div class="toggle-desc">被语音唤醒打断后自动恢复播放</div>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="chk-auto-resume">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div class="delay-row">
+                    <span class="delay-label">恢复延迟</span>
+                    <input type="number" class="input-number" id="input-resume-delay" value="5" min="1" max="300">
+                    <span class="delay-unit">秒</span>
+                </div>
+                <div class="btn-row">
+                    <button class="btn btn-primary" id="btn-save-experimental">保存并重新启动</button>
+                </div>
+                <p class="tip" id="tip-experimental"></p>
+            </div>
+        </div>
+
+        <!-- 右侧：设备与状态 -->
+        <div class="col-right">
+            <div class="card" id="card-devices">
+                <div class="card-header">
+                    <span class="card-title">选择音箱</span>
+                </div>
+                <p class="tip" style="margin-top: 0; margin-bottom: 4px;">勾选要作为媒体接收器的小爱音箱，点击名称可自定义显示名称</p>
+                <div class="device-list" id="device-list">
+                    <div class="loading">请先登录小米账号</div>
+                </div>
+                <div class="btn-row">
+                    <button class="btn btn-success" id="btn-save" disabled>保存并重新启动</button>
+                </div>
+                <p class="tip" id="tip-save"></p>
+            </div>
+
+            <div class="card" id="card-renderers">
+                <div class="card-header">
+                    <span class="card-title">渲染器状态</span>
+                </div>
+                <div id="renderers-list">
+                    <div class="loading">暂无运行中的渲染器</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        <div class="footer-text">MiAir v0.1.2</div>
+    </div>
+</div>
+
+<script>
+let currentSetting = {};
+
+document.addEventListener('DOMContentLoaded', init);
+
+async function init() {
+    await fetchSetting(true);
+    startAutoRefresh();
+}
+
+let _initialLoaded = false;
+
+async function fetchSetting(withDeviceList) {
+    try {
+        const url = withDeviceList ? '/api/setting?need_device_list=true' : '/api/setting';
+        const resp = await fetch(url);
+        const data = await resp.json();
+        currentSetting = data;
+        updateStatusBar(data);
+
+        // 仅首次加载时填充账号和实验性设置，避免覆盖用户正在编辑的内容
+        if (!_initialLoaded) {
+            _initialLoaded = true;
+            if (data.cookie) {
+                const userIdMatch = data.cookie.match(/userId=([^;]+)/);
+                const passTokenMatch = data.cookie.match(/passToken=([^;]+)/);
+                if (userIdMatch) document.getElementById('input-userId').value = userIdMatch[1];
+                if (passTokenMatch) document.getElementById('input-passToken').value = passTokenMatch[1];
+            }
+            loadExperimentalSettings();
+        }
+
+        if (data.device_list && data.device_list.length > 0) {
+            renderDeviceList(data.device_list, data.mi_did || '');
+        } else if (data.has_account && withDeviceList) {
+            document.getElementById('device-list').innerHTML = '<div class="loading">未发现设备，请检查账号是否正确</div>';
+        }
+
+        if (data.dlna_running) await fetchRenderers();
+    } catch (e) {
+        console.error('fetch setting error:', e);
+    }
+}
+
+function updateStatusBar(data) {
+    const bar = document.getElementById('status-bar');
+    const text = document.getElementById('status-text');
+    const dot = bar.querySelector('.status-dot');
+
+    if (data.dlna_running) {
+        bar.className = 'status-bar status-running';
+        dot.className = 'status-dot dot-green';
+        text.textContent = '服务运行中 · ' + data.renderers_count + ' 个渲染器 · ' + data.hostname + ':' + data.dlna_port;
+    } else if (data.has_account && data.mi_did) {
+        bar.className = 'status-bar status-stopped';
+        dot.className = 'status-dot dot-yellow';
+        text.textContent = '已配置，服务未运行';
+    } else if (data.has_account) {
+        bar.className = 'status-bar status-stopped';
+        dot.className = 'status-dot dot-yellow';
+        text.textContent = '已登录，请选择音箱设备';
+    } else {
+        bar.className = 'status-bar status-stopped';
+        dot.className = 'status-dot dot-yellow';
+        text.textContent = '请配置小米账号';
+    }
+}
+
+const deviceModelMap = {
+    'L06A': { model: '小爱音箱', image: 'L06A.webp' },
+    'L07A': { model: 'Redmi小爱音箱 Play', image: 'L07A.webp' },
+    'S12': { model: '小米AI音箱', image: 'S12_S12A_MDZ-25-DA.webp' },
+    'S12A': { model: '小米AI音箱', image: 'S12_S12A_MDZ-25-DA.webp' },
+    'MDZ-25-DA': { model: '小米AI音箱', image: 'S12_S12A_MDZ-25-DA.webp' },
+    'LX5A': { model: '小爱音箱 万能遥控版', image: 'LX5A.webp' },
+    'LX05': { model: '小爱音箱Play (2019款)', image: 'LX05.webp' },
+    'L15A': { model: '小米AI音箱（第二代）', image: 'L15A.webp' },
+    'L16A': { model: 'Xiaomi Sound', image: 'L16A.webp' },
+    'L17A': { model: 'Xiaomi Sound Pro', image: 'L17A.webp' },
+    'LX06': { model: '小爱音箱Pro', image: 'LX06.webp' },
+    'LX01': { model: '小爱音箱mini', image: 'LX01.webp' },
+    'L05B': { model: '小爱音箱Play', image: 'L05B.webp' },
+    'L05C': { model: '小爱音箱Play 增强版', image: 'L05C.webp' },
+    'L09A': { model: '小爱音箱Art', image: 'L09A.webp' },
+    'LX04': { model: '小爱触屏音箱', image: 'LX04_X10A_X08A.webp' },
+    'X10A': { model: '小爱触屏音箱', image: 'LX04_X10A_X08A.webp' },
+    'X08A': { model: '小爱触屏音箱', image: 'LX04_X10A_X08A.webp' },
+    'X08C': { model: '小米触屏音箱', image: 'X08C_X08E_X8F.webp' },
+    'X08E': { model: '小米触屏音箱', image: 'X08C_X08E_X8F.webp' },
+    'X8F': { model: '小米触屏音箱', image: 'X08C_X08E_X8F.webp' },
+    'M01': { model: '小爱音箱HD', image: 'L05B.webp' },
+    'XMYX01JY': { model: '小爱音箱HD', image: 'L05B.webp' },
+    'OH2P': { model: 'Xiaomi 智能音箱 Pro', image: 'OH2P.webp' },
+    'OH2': { model: 'Xiaomi 智能音箱', image: 'OH2.webp' }
+};
+
+function getDeviceInfo(hardware) {
+    if (!hardware) return { model: '未知设备', image: 'L05B.webp' };
+    if (deviceModelMap[hardware]) return deviceModelMap[hardware];
+    for (const key in deviceModelMap) {
+        if (hardware.includes(key)) return deviceModelMap[key];
+    }
+    return { model: hardware, image: 'L05B.webp' };
+}
+
+function renderDeviceList(devices, selectedDids) {
+    const container = document.getElementById('device-list');
+    const selectedList = selectedDids ? selectedDids.split(',') : [];
+
+    if (!devices || devices.length === 0) {
+        container.innerHTML = '<div class="loading">未发现可用设备</div>';
+        return;
+    }
+
+    let html = '';
+    devices.forEach(function(device) {
+        const did = device.miotDID || '';
+        const name = device.name || '未知设备';
+        const hardware = device.hardware || '';
+        const checked = selectedList.includes(did) ? 'checked' : '';
+        const selectedClass = selectedList.includes(did) ? ' selected' : '';
+        const deviceInfo = getDeviceInfo(hardware);
+        const imagePath = '/static/devicespic/' + deviceInfo.image;
+        const displayName = (currentSetting.speakers && currentSetting.speakers[did])
+            ? currentSetting.speakers[did].dlna_name : name;
+
+        html += '<div class="device-item' + selectedClass + '" onclick="toggleDevice(this)">' +
+            '<input type="checkbox" value="' + did + '" ' + checked + ' onclick="event.stopPropagation()">' +
+            '<div class="device-image" style="background-image: url(\'' + imagePath + '\')"></div>' +
+            '<div class="device-info">' +
+            '<input type="text" class="device-name-input" value="' + displayName + '" data-did="' + did + '" onblur="saveSpeakerName(this)" onclick="event.stopPropagation()">' +
+            '<div class="device-meta">' + deviceInfo.model + ' · ' + hardware + '</div>' +
+            '</div></div>';
+    });
+    container.innerHTML = html;
+    document.getElementById('btn-save').disabled = false;
+}
+
+function toggleDevice(el) {
+    const cb = el.querySelector('input[type="checkbox"]');
+    cb.checked = !cb.checked;
+    el.classList.toggle('selected', cb.checked);
+}
+
+document.getElementById('btn-fetch-devices').addEventListener('click', async function() {
+    const userId = document.getElementById('input-userId').value.trim();
+    const passToken = document.getElementById('input-passToken').value.trim();
+    const tip = document.getElementById('tip-account');
+    const btn = this;
+
+    if (!userId || !passToken) {
+        tip.textContent = '请输入 userId 和 passToken';
+        tip.className = 'tip error';
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = '登录中...';
+    tip.textContent = '';
+
+    try {
+        const cookie = `userId=${userId}; passToken=${passToken}`;
+        await fetch('/api/setting', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookie }),
+        });
+
+        const resp = await fetch('/api/devices');
+        const data = await resp.json();
+
+        if (data.error) {
+            tip.textContent = data.error;
+            tip.className = 'tip error';
+        } else if (data.devices && data.devices.length > 0) {
+            tip.textContent = '登录成功，发现 ' + data.devices.length + ' 个设备';
+            tip.className = 'tip success';
+            renderDeviceList(data.devices, currentSetting.mi_did || '');
+        } else {
+            tip.textContent = '未发现可用设备，请检查账号是否正确';
+            tip.className = 'tip error';
+        }
+    } catch (e) {
+        tip.textContent = '请求失败: ' + e.message;
+        tip.className = 'tip error';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '登录并获取设备';
+    }
+});
+
+document.getElementById('btn-save').addEventListener('click', async function() {
+    const checkboxes = document.querySelectorAll('#device-list input[type="checkbox"]:checked');
+    const selectedDids = Array.from(checkboxes).map(cb => cb.value);
+    const tip = document.getElementById('tip-save');
+    const btn = this;
+
+    if (selectedDids.length === 0) {
+        tip.textContent = '请至少选择一个设备';
+        tip.className = 'tip error';
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = '保存中...';
+    tip.textContent = '';
+
+    try {
+        const resp = await fetch('/api/setting', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mi_did: selectedDids.join(',') }),
+        });
+        const data = await resp.json();
+
+        if (data.ok) {
+            tip.textContent = data.message;
+            tip.className = 'tip success';
+            // 服务重启中，等待后刷新
+            setTimeout(() => location.reload(), 4000);
+        } else {
+            tip.textContent = data.message || '保存失败';
+            tip.className = 'tip error';
+        }
+    } catch (e) {
+        // 进程重启导致连接断开是正常的
+        tip.textContent = '正在重启服务...';
+        tip.className = 'tip success';
+        setTimeout(() => location.reload(), 4000);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '保存并启动';
+    }
+});
+
+async function fetchRenderers() {
+    try {
+        const resp = await fetch('/api/speakers');
+        const speakers = await resp.json();
+        renderRenderers(speakers);
+    } catch (e) { /* ignore */ }
+}
+
+function formatSourceFromUri(uri) {
+    if (!uri) return '';
+    try {
+        var parts = uri.split('/');
+        var host = parts[2] || '';
+        if (!host) return '来自 未知来源';
+        // QQ音乐特殊处理：有时第2-3根斜杠间是IP，真实域名在第3-4根斜杠间
+        var hostAndPath = host + '/' + (parts[3] || '');
+        if (hostAndPath.indexOf('qq') !== -1) return '来自 QQ音乐';
+        if (host.indexOf('music.126') !== -1 || host.indexOf('music.163') !== -1) return '来自 网易云音乐';
+        if (host.indexOf('kugou') !== -1) return '来自 酷狗音乐';
+        if (host.indexOf('kuwo') !== -1) return '来自 酷我音乐';
+        return '来自 ' + host;
+    } catch(e) { return '来自 未知来源'; }
+}
+
+function renderRenderers(speakers) {
+    const container = document.getElementById('renderers-list');
+    if (!speakers || speakers.length === 0) {
+        container.innerHTML = '<div class="loading">暂无运行中的渲染器</div>';
+        return;
+    }
+
+    const stateMap = {
+        'NO_MEDIA_PRESENT': '空闲',
+        'STOPPED': '已停止',
+        'PLAYING': '播放中',
+        'PAUSED_PLAYBACK': '已暂停',
+        'TRANSITIONING': '加载中'
+    };
+
+    let html = '';
+    speakers.forEach(function(s) {
+        let stateClass = '';
+        let stateText = '';
+        let sourceInfo = '';
+        let badgeHtml = '';
+
+        if (s.airplay_active) {
+            badgeHtml = '<span class="badge badge-airplay">AirPlay</span>';
+            stateClass = ' playing';
+            stateText = '播放中';
+            sourceInfo = '来自 ' + (s.airplay_client || '苹果设备');
+        } else if (s.transport_state === 'PLAYING') {
+            badgeHtml = '<span class="badge badge-dlna">DLNA</span>';
+            stateClass = ' playing';
+            stateText = '播放中';
+            sourceInfo = formatSourceFromUri(s.current_uri);
+        } else {
+            stateText = stateMap[s.transport_state] || s.transport_state;
+            sourceInfo = s.current_uri ? formatSourceFromUri(s.current_uri) : '';
+        }
+
+        const deviceInfo = getDeviceInfo(s.hardware);
+        html += '<div class="speaker-card">' +
+            '<div class="speaker-left">' +
+            '<div class="speaker-name">' + s.dlna_name + badgeHtml + '</div>' +
+            '<div class="speaker-source">' + deviceInfo.model + (sourceInfo ? ' · ' + sourceInfo : '') + '</div>' +
+            '</div>' +
+            '<span class="speaker-state' + stateClass + '">' + stateText + '</span>' +
+            '</div>';
+    });
+    container.innerHTML = html;
+}
+
+async function saveSpeakerName(input) {
+    const did = input.dataset.did;
+    const newName = input.value.trim();
+    if (!newName) return;
+
+    try {
+        const resp = await fetch(`/api/speakers/${did}/rename`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dlna_name: newName }),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            if (!currentSetting.speakers) currentSetting.speakers = {};
+            if (!currentSetting.speakers[did]) currentSetting.speakers[did] = {};
+            currentSetting.speakers[did].dlna_name = newName;
+        }
+    } catch (e) {
+        console.error('保存音箱名称失败:', e);
+    }
+}
+
+function startAutoRefresh() {
+    setInterval(async function() {
+        await fetchSetting(false);
+        if (currentSetting.dlna_running) await fetchRenderers();
+    }, 5000);
+}
+
+document.getElementById('btn-save-experimental').addEventListener('click', async function() {
+    const autoResume = document.getElementById('chk-auto-resume').checked;
+    const resumeDelay = parseInt(document.getElementById('input-resume-delay').value) || 5;
+    const tip = document.getElementById('tip-experimental');
+    const btn = this;
+
+    btn.disabled = true;
+    btn.textContent = '保存中...';
+    tip.textContent = '';
+
+    try {
+        const resp = await fetch('/api/setting', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                auto_resume_on_interrupt: autoResume,
+                resume_delay_seconds: resumeDelay,
+            }),
+        });
+        const data = await resp.json();
+
+        if (data.ok) {
+            tip.textContent = '设置已保存';
+            tip.className = 'tip success';
+            currentSetting.auto_resume_on_interrupt = autoResume;
+            currentSetting.resume_delay_seconds = resumeDelay;
+        } else {
+            tip.textContent = data.message || '保存失败';
+            tip.className = 'tip error';
+        }
+    } catch (e) {
+        // 进程重启
+        tip.textContent = '正在重启服务...';
+        tip.className = 'tip success';
+        setTimeout(() => location.reload(), 4000);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '保存并重新启动';
+    }
+});
+
+function loadExperimentalSettings() {
+    if (currentSetting.auto_resume_on_interrupt !== undefined) {
+        document.getElementById('chk-auto-resume').checked = currentSetting.auto_resume_on_interrupt;
+    }
+    if (currentSetting.resume_delay_seconds !== undefined) {
+        document.getElementById('input-resume-delay').value = currentSetting.resume_delay_seconds;
+    }
+}
+</script>
+</body>
+</html>
