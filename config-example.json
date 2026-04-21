@@ -1,0 +1,18 @@
+{
+    "account": "",
+    "password": "",
+    "mi_did": "",
+    "cookie": "",
+    "hostname": "",
+    "dlna_port": 8200,
+    "web_port": 8300,
+    "conf_path": "conf",
+    "verbose": false,
+    "proxy_enabled": false,
+    "auto_play_on_set_uri": false,
+    "auto_resume_on_interrupt": false,
+    "resume_delay_seconds": 5,
+    "enable_voice_control": false,
+    "voice_poll_interval": 1,
+    "speakers": {}
+}

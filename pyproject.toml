@@ -1,0 +1,24 @@
+[project]
+name = "miair"
+version = "0.1.0"
+description = "Make Xiaomi AI speakers act as Music renderers"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "miservice-fork",
+    "zeroconf>=0.38.0",
+    "pycryptodome>=3.15.0",
+    "av>=10.0.0",
+]
+
+[project.scripts]
+miair = "miair.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["miair*"]
