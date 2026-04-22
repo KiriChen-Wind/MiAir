@@ -126,12 +126,8 @@ class AirPlayServer:
         self._rtsp_thread: threading.Thread | None = None
         self._running = False
 
-        # 音频流服务器 - 根据音箱型号选择输出格式
-        # L05B, L05C, LX06, L16A 需要 MP3，其它音箱用 WAV（更低延迟）
-        from miair.config import Speaker
-        need_mp3 = speaker_hardware in Speaker._NON_LOSSLESS_HARDWARE
-        audio_format = "mp3" if need_mp3 else "wav"
-        self._stream_server = AudioStreamServer(hostname, 0, audio_format=audio_format)
+        # 音频流服务器 - 统一使用 WAV 输出（零编码延迟，不卡顿）
+        self._stream_server = AudioStreamServer(hostname, 0, audio_format="wav")
         self.stream_port = 0
 
         # mDNS 广播
@@ -251,12 +247,40 @@ class AirPlayServer:
             except Exception as e:
                 log.error(f"RTSP accept error: {e}")
 
+    def _safe_call_on_play_stop(self):
+        """线程安全地调用 on_play_stop 回调
+        
+        从同步线程中安全地触发可能涉及异步操作的回调。
+        """
+        if not self.on_play_stop:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(self.on_play_stop)
+            else:
+                self.on_play_stop()
+        except RuntimeError:
+            # 没有事件循环，直接调用
+            try:
+                self.on_play_stop()
+            except Exception as e:
+                log.error(f"on_play_stop error: {e}")
+        except Exception as e:
+            log.error(f"on_play_stop error: {e}")
+
     def _handle_rtsp_client(self, sock: socket.socket, addr: tuple):
         """处理 RTSP 客户端连接"""
         log.info(f"AirPlay 客户端连接: {addr}")
         session_active = False
         rtp_socket = None
         rtp_thread = None
+        control_socket = None
+        timing_socket = None
+        teardown_done = False  # 避免 TEARDOWN 和 finally 双重触发回调
+
+        # 设置客户端 socket 超时，防止无限阻塞导致线程卡死
+        sock.settimeout(30.0)
 
         try:
             while self._running:
@@ -340,7 +364,7 @@ class AirPlayServer:
                     self._handle_announce(sock, headers, body, cseq)
 
                 elif method == "SETUP":
-                    session_active, rtp_socket = self._handle_setup(sock, headers, cseq)
+                    session_active, rtp_socket, control_socket, timing_socket = self._handle_setup(sock, headers, cseq)
 
                 elif method == "RECORD":
                     self._handle_record(sock, cseq)
@@ -361,11 +385,8 @@ class AirPlayServer:
                     self._is_playing = False
                     self._client_name = ""
                     self._stream_server.stop_streaming()
-                    if self.on_play_stop:
-                        try:
-                            self.on_play_stop()
-                        except Exception as e:
-                            log.error(f"on_play_stop error: {e}")
+                    teardown_done = True
+                    self._safe_call_on_play_stop()
                     self._send_rtsp_response(sock, 200, cseq)
                     break
 
@@ -415,22 +436,26 @@ class AirPlayServer:
                     log.info(f"未处理的 RTSP 方法: {method} {path}")
                     self._send_rtsp_response(sock, 200, cseq)
 
+        except socket.timeout:
+            log.warning(f"RTSP 客户端超时: {addr}")
         except Exception as e:
             log.error(f"RTSP handler error: {e}")
         finally:
             # 无论正常 TEARDOWN 还是异常断开，都要重置播放状态
             self._is_playing = False
             self._client_name = ""
-            if rtp_socket:
-                rtp_socket.close()
+            # 关闭所有 socket（RTP、RTCP control、timing）
+            for s in (rtp_socket, control_socket, timing_socket):
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
             sock.close()
             log.info(f"AirPlay 客户端断开: {addr}")
-            # 异常断开时也触发 on_play_stop 回调（TEARDOWN 路径已触发过）
-            if self.on_play_stop:
-                try:
-                    self.on_play_stop()
-                except Exception:
-                    pass
+            # 异常断开时触发 on_play_stop 回调（TEARDOWN 已触发过则跳过）
+            if not teardown_done:
+                self._safe_call_on_play_stop()
 
     def _handle_fp_setup(self, sock: socket.socket, body: bytes, cseq: str):
         """处理 FairPlay 认证 (POST /fp-setup)
@@ -741,7 +766,7 @@ class AirPlayServer:
             "Audio-Jack-Status": "connected; type=analog",
         })
 
-        return True, rtp_socket
+        return True, rtp_socket, control_socket, timing_socket
 
     def _rtcp_loop(self, rtcp_socket: socket.socket):
         """RTCP 控制包接收循环"""

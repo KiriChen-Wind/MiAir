@@ -33,15 +33,15 @@ class Speaker:
     def needs_audio_conversion(self, content_type: str = "") -> bool:
         """检查是否需要转换音频格式
         
-        部分音箱不支持无损格式，需要将非mp3格式转换为mp3
+        部分音箱不支持无损格式，需要转换为 WAV (PCM) 播放
         """
         if self.hardware not in self._NON_LOSSLESS_HARDWARE:
             return False
         
-        # 检查内容类型是否为mp3
+        # 已经是可直接播放的格式则不需要转换
         if content_type:
-            content_type_lower = content_type.lower()
-            if "mp3" in content_type_lower or "mpeg" in content_type_lower:
+            ct = content_type.lower()
+            if "mp3" in ct or "mpeg" in ct or "wav" in ct or "x-wav" in ct:
                 return False
         
         return True

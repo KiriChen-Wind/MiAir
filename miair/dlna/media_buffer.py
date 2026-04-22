@@ -296,8 +296,14 @@ class MediaBuffer:
                     timeout=60
                 )
             except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except (asyncio.TimeoutError, Exception):
+                    log.warning("ffmpeg转换进程杀死后等待超时")
                 log.error("ffmpeg转换超时")
                 return False
             

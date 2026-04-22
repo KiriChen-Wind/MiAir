@@ -394,10 +394,11 @@ class AudioStreamServer:
         finally:
             try:
                 proc.terminate()
-                proc.wait(timeout=1)
+                proc.wait(timeout=2)
             except Exception:
                 try:
                     proc.kill()
+                    proc.wait(timeout=2)
                 except Exception:
                     pass
 

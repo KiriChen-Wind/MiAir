@@ -1,6 +1,6 @@
 [project]
 name = "miair"
-version = "0.1.0"
+version = "0.1.2"
 description = "Make Xiaomi AI speakers act as Music renderers"
 readme = "README.md"
 license = {text = "MIT"}

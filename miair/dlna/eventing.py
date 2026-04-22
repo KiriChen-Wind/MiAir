@@ -79,21 +79,18 @@ class EventManager:
         return False
 
     async def notify_all(self, event_xml: str):
-        """向所有活跃订阅者发送事件通知 (非阻塞，fire-and-forget)"""
+        """向所有活跃订阅者发送事件通知 (fire-and-forget，不等待慢订阅者)"""
         expired_sids = []
-        tasks = []
         for sid, sub in self._subscriptions.items():
             if sub.expired:
                 expired_sids.append(sid)
                 continue
-            tasks.append(self._send_notify(sub, event_xml))
+            # fire-and-forget: 创建任务但不等待，避免慢订阅者阻塞事件通知
+            task = asyncio.create_task(self._send_notify(sub, event_xml))
+            task.add_done_callback(lambda t: None)  # 阻止未捕获异常警告
 
         for sid in expired_sids:
             del self._subscriptions[sid]
-
-        # 并发发送，不等待结果 (fire-and-forget)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _send_notify(self, sub: Subscription, event_xml: str):
         """发送 NOTIFY 到订阅者 (使用持久 session)"""
@@ -125,7 +122,7 @@ class EventManager:
         """定期清理过期订阅和空闲 session"""
         try:
             while True:
-                await asyncio.sleep(300)
+                await asyncio.sleep(60)  # 从 300 秒缩短到 60 秒，更及时释放资源
                 expired = [
                     sid for sid, sub in self._subscriptions.items() if sub.expired
                 ]

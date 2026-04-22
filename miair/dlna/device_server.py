@@ -16,6 +16,7 @@ from miair.const import (
     TRANSPORT_STATE_PAUSED,
     TRANSPORT_STATE_PLAYING,
     TRANSPORT_STATE_STOPPED,
+    TRANSPORT_STATE_TRANSITIONING,
 )
 from miair.dlna.eventing import EventManager, build_last_change_event
 from miair.dlna.media_buffer import MediaBuffer
@@ -58,6 +59,10 @@ class DeviceServer:
         self._proxy_session: aiohttp.ClientSession | None = None
         self._ffmpeg_path: str | None = None
         self._ffmpeg_checked: bool = False
+        # seek 缓冲的创建时间戳，用于 TTL 清理
+        self._buffer_created_time: dict[str, float] = {}  # buffer_id -> time.time()
+        # 缓冲最后被代理访问的时间，保护正在被流式传输的缓冲不被清理
+        self._buffer_last_accessed: dict[str, float] = {}  # buffer_id -> time.time()
         # 实验性功能：打断后续播
         self._resume_tasks: dict[str, asyncio.Task] = {}  # udn -> resume task
         # 追踪活跃的代理任务，用于强制中止
@@ -104,9 +109,13 @@ class DeviceServer:
         self.app.router.add_get("/media/{token}", self._handle_media_proxy)
 
     def _get_proxy_session(self) -> aiohttp.ClientSession:
-        """获取/创建用于下载的持久 session"""
+        """获取/创建用于下载的持久 session，带连接池限制"""
         if not self._proxy_session or self._proxy_session.closed:
-            self._proxy_session = aiohttp.ClientSession()
+            connector = aiohttp.TCPConnector(
+                limit=50,  # 连接池上限（默认100太大，10太小会卡住多线程下载）
+                ttl_dns_cache=300,  # DNS 缓存 5 分钟
+            )
+            self._proxy_session = aiohttp.ClientSession(connector=connector)
         return self._proxy_session
 
     def register_renderer(self, renderer: DLNARenderer):
@@ -133,6 +142,7 @@ class DeviceServer:
         buf = MediaBuffer(remote_url)
         self._media_buffers[buffer_id] = buf
         self._url_to_buffer[remote_url] = buffer_id
+        self._buffer_created_time[buffer_id] = time.time()
         asyncio.get_running_loop().create_task(buf.start_download(self._get_proxy_session()))
         log.info(f"预缓冲已启动: {remote_url[:80]}...")
 
@@ -238,6 +248,7 @@ class DeviceServer:
         self._cleanup_old_buffers()
         seek_bid = secrets.token_urlsafe(16)
         self._media_buffers[seek_bid] = seek_buf
+        self._buffer_created_time[seek_bid] = time.time()
 
         token = secrets.token_urlsafe(16)
         self._proxy_tokens[token] = (seek_bid, 0, udn)
@@ -329,6 +340,7 @@ class DeviceServer:
 
         in_fd, in_path = tempfile.mkstemp(suffix=suffix, prefix="miair_si_")
         out_fd, out_path = tempfile.mkstemp(suffix=suffix, prefix="miair_so_")
+        proc = None
         try:
             with os.fdopen(in_fd, "wb") as f:
                 f.write(data)
@@ -355,15 +367,26 @@ class DeviceServer:
 
         except asyncio.TimeoutError:
             log.warning("ffmpeg seek 超时")
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except (asyncio.TimeoutError, Exception):
+                    log.warning("ffmpeg seek 进程杀死后等待超时")
             return None
         except Exception as e:
             return None
         finally:
+            # 确保进程已终止
+            if proc and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=3)
+                except Exception:
+                    pass
             for p in (in_path, out_path):
                 try:
                     if os.path.exists(p):
@@ -562,10 +585,12 @@ class DeviceServer:
             total_mem -= freed
 
     def _remove_buffer(self, buffer_id: str):
-        """移除一个缓冲及其关联的 token"""
+        """移除一个缓冲及其关联的 token 和时间戳"""
         buf = self._media_buffers.pop(buffer_id, None)
         if buf:
             buf.cleanup()
+        self._buffer_created_time.pop(buffer_id, None)
+        self._buffer_last_accessed.pop(buffer_id, None)
         tokens_to_remove = [
             t for t, (bid, _, _) in self._proxy_tokens.items() if bid == buffer_id
         ]
@@ -584,21 +609,63 @@ class DeviceServer:
         self._media_buffers.clear()
         self._proxy_tokens.clear()
         self._url_to_buffer.clear()
+        self._buffer_created_time.clear()
+        self._buffer_last_accessed.clear()
 
     async def _periodic_buffer_cleanup(self):
         """周期性清理已完成且长时间未访问的缓冲"""
         try:
             while True:
-                await asyncio.sleep(120)  # 每 2 分钟检查一次
-                # 清理已完成下载的旧缓冲（保留最近 _MAX_BUFFERS 个）
+                await asyncio.sleep(60)  # 每 1 分钟检查一次
+                now = time.time()
+                
+                # 收集当前正在播放的 URL 集合（包括 next_uri）
+                active_urls = set()
+                for renderer in self.renderers.values():
+                    if renderer.current_uri:
+                        active_urls.add(renderer.current_uri)
+                    if renderer.next_uri:
+                        active_urls.add(renderer.next_uri)
+                
+                # 清理过时缓冲（创建超过 120 秒且已完成下载的）
+                to_remove = []
+                for bid, buf in self._media_buffers.items():
+                    if not buf.download_complete:
+                        continue
+                    # 跳过最近 120 秒内被代理访问过的缓冲（正在被流式传输）
+                    last_access = self._buffer_last_accessed.get(bid, 0)
+                    if last_access > 0 and (now - last_access) < 120:
+                        continue
+                    created = self._buffer_created_time.get(bid, 0)
+                    if created > 0 and (now - created) > 120:
+                        # 检查是否是当前播放的源 URL
+                        is_active = False
+                        source_url = buf.remote_url
+                        if source_url in active_urls:
+                            # 检查这个 buffer_id 是否是该 URL 的最新缓冲
+                            if self._url_to_buffer.get(source_url) == bid:
+                                is_active = True
+                        if not is_active:
+                            to_remove.append(bid)
+                
+                for bid in to_remove:
+                    self._remove_buffer(bid)
+                if to_remove:
+                    log.info(f"周期清理: 移除 {len(to_remove)} 个过时缓冲")
+                
+                # 原有的数量限制清理（也要跳过最近访问过的缓冲）
                 if len(self._media_buffers) > _MAX_BUFFERS // 2:
                     ids = list(self._media_buffers.keys())
-                    # 保留后半部分（最新的）
                     to_remove = ids[:len(ids) - _MAX_BUFFERS // 2]
                     for bid in to_remove:
                         buf = self._media_buffers.get(bid)
-                        if buf and buf.download_complete:
-                            self._remove_buffer(bid)
+                        if not buf or not buf.download_complete:
+                            continue
+                        # 跳过最近被访问的缓冲
+                        la = self._buffer_last_accessed.get(bid, 0)
+                        if la > 0 and (now - la) < 120:
+                            continue
+                        self._remove_buffer(bid)
                 # 内存上限检查
                 self._cleanup_by_memory()
                 # 清理已完成的 background tasks
@@ -630,6 +697,9 @@ class DeviceServer:
             log.warning(f"代理请求缓冲不存在: {buffer_id}")
             return web.Response(status=404, text="Buffer Not Found")
 
+        # 更新最后访问时间，保护缓冲不被周期清理误删
+        self._buffer_last_accessed[buffer_id] = time.time()
+
         # 注册任务到 udn 追踪列表
         if udn:
             current_task = asyncio.current_task()
@@ -642,20 +712,25 @@ class DeviceServer:
             f"代理请求: base_offset={base_offset}, "
             f"下载进度={buf.downloaded_size}/{buf.total_size or '?'}")
 
-        # 检查是否需要实时流式转换
+        # 检查是否需要转码（不支持无损格式的音箱）
         needs_conversion = False
         if udn and not buf._converted:
             renderer = self.renderers.get(udn)
             if renderer and renderer.speaker:
                 speaker = renderer.speaker.speaker
                 needs_conversion = speaker.needs_audio_conversion(buf.content_type)
-        
-        # 如果需要转换，使用实时流式转换
-        if needs_conversion:
-            return await self._handle_streaming_conversion(request, buf, udn)
 
         # 等待下载完成
         await buf.wait_for_completion(timeout=120)
+        
+        # 如果需要转码，一次性转为 WAV 再提供服务（WAV转码极快，几乎无感）
+        if needs_conversion:
+            if buf.error or not buf.download_complete:
+                log.error(f"音频缓冲未就绪（转码前）: {buf.error}")
+                return web.Response(status=502, text="Buffer Error")
+            ok = await self._convert_buffer_to_wav(buf)
+            if not ok:
+                log.warning(f"WAV 转码失败，尝试原始格式提供服务")
         if buf.error or not buf.download_complete:
             log.error(f"音频缓冲未就绪: {buf.error}")
             return web.Response(status=502, text="Buffer Error")
@@ -728,214 +803,124 @@ class DeviceServer:
                 log.error(f"代理响应失败 ({bytes_sent}/{content_length} bytes): {e}")
             return response
 
-    async def _handle_streaming_conversion(
-        self, request: web.Request, buf: MediaBuffer, udn: str
-    ) -> web.StreamResponse:
-        """实时流式音频转换 - 边下载边转换边播放"""
-        import asyncio
+    async def _convert_buffer_to_wav(self, buf: MediaBuffer) -> bool:
+        """将缓冲中的音频一次性转换为 WAV (PCM) 格式
         
-        renderer = self.renderers.get(udn)
-        speaker = renderer.speaker.speaker if renderer and renderer.speaker else None
-        hardware = speaker.hardware if speaker else "Unknown"
+        WAV 转码极快（纯解码+写PCM），一首5分钟的歌通常1-2秒内完成。
+        转完后直接替换缓冲数据，后续当普通文件提供服务。
+        """
+        if buf._converted:
+            return True
+        if buf._converting:
+            # 另一个请求正在转码，等待完成
+            try:
+                await asyncio.wait_for(buf._convert_event.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                pass
+            return buf._converted
         
-        log.info(f"[{hardware}] 启动实时流式转换: {buf.content_type}")
+        # 已经是可直接播放的格式
+        ct = buf.content_type.lower()
+        if "wav" in ct or "x-wav" in ct or "mp3" in ct or "mpeg" in ct:
+            buf._converted = True
+            return True
         
-        # 等待至少有一些数据可用（避免ffmpeg空输入）
-        # 等待下载开始或2秒
-        for _ in range(20):
-            if buf.downloaded_size > 65536 or buf.download_complete:
-                break
-            await asyncio.sleep(0.1)
-        
-        if buf.downloaded_size < 65536 and not buf.download_complete:
-            log.warning(f"[{hardware}] 等待数据超时，使用原始格式")
-            return await self._handle_proxy_without_conversion(request, buf)
-        
-        # 启动ffmpeg进程进行实时转换
-        ffmpeg_path = self._check_ffmpeg() or 'ffmpeg'
-        cmd = [
-            ffmpeg_path, '-y',
-            '-hide_banner',  # 隐藏版本信息
-            '-loglevel', 'error',  # 只显示错误
-            '-i', 'pipe:0',  # 从stdin读取
-            '-vn',  # 禁用视频
-            '-codec:a', 'libmp3lame',
-            '-q:a', '5',  # 质量设置
-            '-ar', '44100',
-            '-ac', '2',
-            '-f', 'mp3',  # 强制输出格式
-            'pipe:1'  # 输出到stdout
-        ]
+        buf._converting = True
+        input_path = None
+        output_path = None
         
         try:
+            import tempfile
+            
+            # 写入临时输入文件（ffmpeg 可以 seek 输入，比 pipe 更可靠）
+            with tempfile.NamedTemporaryFile(suffix='.input', delete=False) as f:
+                input_path = f.name
+                f.write(buf.data)
+            output_path = input_path + '.wav'
+            
+            ffmpeg_path = self._check_ffmpeg() or 'ffmpeg'
+            cmd = [
+                ffmpeg_path, '-y',
+                '-hide_banner',
+                '-loglevel', 'error',
+                '-i', input_path,
+                '-vn',                    # 禁用视频
+                '-codec:a', 'pcm_s16le',  # 16-bit PCM
+                '-ar', '44100',           # 44.1kHz 采样率
+                '-ac', '2',               # 立体声
+                '-threads', '0',          # 使用所有 CPU 核心
+                output_path
+            ]
+            
+            original_size = len(buf.data)
+            log.info(f"WAV 转码开始: {buf.content_type} ({original_size} bytes)")
+            
             process = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-        except Exception as e:
-            log.error(f"[{hardware}] 启动ffmpeg失败: {e}")
-            return await self._handle_proxy_without_conversion(request, buf)
-        
-        # 设置响应头
-        # 对于流式转换，不设置Content-Length，让aiohttp使用chunked encoding
-        resp_headers = {
-            "Content-Type": "audio/mpeg",
-            "Accept-Ranges": "none",  # 流式转换不支持Range
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        }
-        response = web.StreamResponse(status=200, headers=resp_headers)
-        # 禁用chunked encoding的自动计算，手动控制
-        response.enable_chunked_encoding()
-        
-        # 启动数据写入ffmpeg的task
-        async def feed_ffmpeg():
-            """将下载的数据写入ffmpeg stdin"""
+            
             try:
-                last_size = 0
-                while True:
-                    current_size = buf.downloaded_size
-                    if current_size > last_size:
-                        # 有新数据，写入ffmpeg
-                        data = bytes(buf.data[last_size:current_size])
-                        await process.stdin.write(data)
-                        # await process.stdin.drain()
-                        last_size = current_size
-                    
-                    if buf.download_complete:
-                        # 下载完成，关闭stdin
-                        if process.stdin:
-                            process.stdin.close()
-                        break
-                    
-                    await asyncio.sleep(0.01)  # 10ms检查一次，更频繁
-            except Exception as e:
-                pass
-            finally:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=30  # WAV 转码很快，30 秒绰绰有余
+                )
+            except asyncio.TimeoutError:
                 try:
-                    if process.stdin and not process.stdin.is_closing():
-                        process.stdin.close()
+                    process.kill()
                 except Exception:
                     pass
-        
-        # 启动feed task
-        feed_task = asyncio.create_task(feed_ffmpeg())
-        
-        # 启动错误读取task
-        async def read_stderr():
-            """读取ffmpeg错误输出"""
-            try:
-                stderr_data = await process.stderr.read()
-                if stderr_data:
-                    stderr_str = stderr_data.decode('utf-8', errors='ignore')
-                    if stderr_str.strip():
-                        pass
-            except Exception as e:
-                pass
-        
-        stderr_task = asyncio.create_task(read_stderr())
-        
-        bytes_sent = 0
-        first_chunk_sent = False
-        try:
-            await response.prepare(request)
-            
-            # 从ffmpeg stdout读取转换后的数据并发送
-            start_time = asyncio.get_running_loop().time()
-            last_data_time = start_time
-            
-            while True:
                 try:
-                    # 使用wait_for避免永久阻塞
-                    chunk = await asyncio.wait_for(
-                        process.stdout.read(65536),
-                        timeout=2.0  # 缩短超时时间
-                    )
-                    if chunk:
-                        await response.write(chunk)
-                        bytes_sent += len(chunk)
-                        last_data_time = asyncio.get_running_loop().time()
-                        
-                        if not first_chunk_sent:
-                            first_chunk_sent = True
-                            log.info(f"[{hardware}] 开始发送转换后的音频数据")
-                    else:
-                        # 没有更多数据
-                        if buf.download_complete:
-                            break
-                        # 等待更多数据
-                        await asyncio.sleep(0.05)
-                        
-                        # 检查是否超时（5秒内没有发送数据）
-                        current_time = asyncio.get_running_loop().time()
-                        if current_time - last_data_time > 5.0:
-                            log.warning(f"[{hardware}] 流式转换超时，可能没有更多数据")
-                            break
-                        continue
-                    
-                except asyncio.TimeoutError:
-                    # 检查是否下载完成
-                    if buf.download_complete:
-                        # 再试一次读取
-                        chunk = await process.stdout.read(65536)
-                        if chunk:
-                            await response.write(chunk)
-                            bytes_sent += len(chunk)
-                        break
-                    
-                    # 检查是否长时间没有数据
-                    current_time = asyncio.get_running_loop().time()
-                    if current_time - last_data_time > 5.0:
-                        log.warning(f"[{hardware}] 流式转换长时间无数据，结束传输")
-                        break
-                    continue
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except Exception:
+                    pass
+                log.error("WAV 转码超时")
+                return False
             
-            # 如果根本没有发送任何数据，说明转换失败
-            if bytes_sent == 0:
-                log.error(f"[{hardware}] 流式转换未产生任何数据")
-                # 返回一个错误响应
-                return web.Response(status=502, text="Conversion failed")
+            if process.returncode != 0:
+                stderr_str = stderr.decode('utf-8', errors='ignore') if stderr else ""
+                log.error(f"WAV 转码失败 (rc={process.returncode}): {stderr_str[:200]}")
+                return False
             
-            await response.write_eof()
-            log.info(f"[{hardware}] 实时流式转换完成: {bytes_sent} bytes")
-            return response
+            # 读取转码结果
+            if not os.path.isfile(output_path):
+                log.error("WAV 转码未产生输出文件")
+                return False
             
-        except asyncio.CancelledError:
-            raise
-        except (ConnectionError, ConnectionResetError, BrokenPipeError):
-            # 客户端断开连接是正常现象
-            log.info(f"[{hardware}] 流式传输: 客户端断开 ({bytes_sent} bytes sent)")
-            return response
+            with open(output_path, 'rb') as f:
+                wav_data = f.read()
+            
+            if not wav_data:
+                log.error("WAV 转码输出文件为空")
+                return False
+            
+            # 替换缓冲数据
+            buf.data = bytearray(wav_data)
+            buf.total_size = len(buf.data)
+            buf.content_type = "audio/wav"
+            buf._converted = True
+            
+            log.info(
+                f"WAV 转码完成: {buf.total_size} bytes "
+                f"(原 {original_size} bytes, {buf.total_size / max(original_size, 1):.1f}x)"
+            )
+            return True
+            
         except Exception as e:
-            err_msg = str(e)
-            if "Cannot write to closing transport" in err_msg or "Connection" in err_msg:
-                log.info(f"[{hardware}] 流式传输: 客户端断开 ({bytes_sent} bytes sent)")
-                return response
-            log.warning(f"[{hardware}] 流式传输中断: {e}")
-            raise
+            log.error(f"WAV 转码异常: {e}")
+            return False
         finally:
-            # 清理
-            feed_task.cancel()
-            try:
-                await feed_task
-            except asyncio.CancelledError:
-                pass
-            
-            stderr_task.cancel()
-            try:
-                await stderr_task
-            except asyncio.CancelledError:
-                pass
-            
-            try:
-                process.kill()
-                await asyncio.wait_for(process.wait(), timeout=3.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
-    
+            # 清理临时文件和状态
+            for p in (input_path, output_path):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+            buf._converting = False
+            buf._convert_event.set()
+
     def _get_ffmpeg_input_format(self, content_type: str, remote_url: str = "") -> str:
         """根据Content-Type和URL获取ffmpeg输入格式"""
         content_type_lower = content_type.lower()
@@ -1213,6 +1198,10 @@ class DeviceServer:
             return
 
         old_state = renderer.transport_state
+
+        # TRANSITIONING 保护：play()/seek() 正在执行中，轮询结果是过时的，跳过同步
+        if old_state == TRANSPORT_STATE_TRANSITIONING:
+            return
 
         # 宽限期内：音箱还没真正开始播放（转码中），不覆盖 PLAYING 状态
         if (

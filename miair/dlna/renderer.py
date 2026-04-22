@@ -120,6 +120,7 @@ class DLNARenderer:
 
     async def _check_play_status(self):
         """定期检查播放状态，当歌曲接近结束时主动触发下一曲"""
+        near_end_count = 0  # 连续检测到接近结尾的次数
         while True:
             await asyncio.sleep(1)
             async with self._lock:
@@ -130,12 +131,16 @@ class DLNARenderer:
                 current_position = self._get_elapsed_time()
                 
                 # 如果有曲长信息，且接近结束（剩余1秒以内）
-                # 调整为1秒，避免过早触发导致安卓手机提前下一曲
+                # 需要连续2次检测确认，避免位置计算偏差导致误触发
                 if self._track_duration > 0 and (self._track_duration - current_position) < 1.0:
-                    log.info(f"[{self.friendly_name}] 歌曲即将结束，剩余 {self._track_duration - current_position:.1f} 秒")
-                    # 主动触发下一曲
-                    asyncio.get_running_loop().create_task(self.next_track())
-                    break
+                    near_end_count += 1
+                    if near_end_count >= 2:
+                        log.info(f"[{self.friendly_name}] 歌曲即将结束，剩余 {self._track_duration - current_position:.1f} 秒")
+                        # 主动触发下一曲
+                        asyncio.get_running_loop().create_task(self.next_track())
+                        break
+                else:
+                    near_end_count = 0
 
     async def play(self) -> bool:
         """开始播放 (DLNA Play)"""
@@ -182,10 +187,10 @@ class DLNARenderer:
 
             # 转码模式: 立即标记为 PLAYING 并设置宽限期
             # 让手机端先收到 PLAYING 通知，避免转码期间手机显示暂停
+            # WAV 转码很快（1-2秒），8秒宽限期绰绰有余
             if needs_transcode:
                 self.transport_state = TRANSPORT_STATE_PLAYING
-                self._play_start_time = time.time()
-                self._play_grace_until = time.time() + 15.0
+                self._play_grace_until = time.time() + 8.0
                 log.info(f"[{self.friendly_name}] 转码模式: 先返回 PLAYING 状态")
 
         # 转码模式: 释放锁后立即推送 PLAYING 给手机端
@@ -254,57 +259,65 @@ class DLNARenderer:
         return success
 
     async def seek(self, unit: str, target: str) -> bool:
-        """Seek - 生成格式正确的 seeked 音频并重新播放"""
-        async with self._lock:
-            if unit == "REL_TIME":
-                seconds = self._parse_time(target)
+        """Seek - 生成格式正确的 seeked 音频并重新播放
+        
+        耗时的 seek_url_func 调用在锁外执行，避免长时间持有锁导致
+        轮询任务阻塞和位置计算混乱。
+        """
+        if unit == "REL_TIME":
+            seconds = self._parse_time(target)
 
-                # 真正的 Seek: 生成从指定时间开始的有效音频流并重新播放
-                if (
-                    self.seek_url_func
-                    and self.speaker
-                    and self.current_uri
-                    and self._track_duration > 0
-                ):
+            # 先在锁外生成 seek URL（耗时操作：等待缓冲+ffmpeg）
+            seek_url = None
+            current_uri = None
+            duration = 0.0
+            if self.seek_url_func and self.speaker and self.current_uri:
+                async with self._lock:
+                    duration = self._track_duration
+                    current_uri = self.current_uri
+                if duration > 0 and current_uri:
                     seek_url = await self.seek_url_func(
-                        self.current_uri, seconds, self._track_duration, self.udn
+                        current_uri, seconds, duration, self.udn
                     )
-                    if seek_url:
-                        log.info(
-                            f"[{self.friendly_name}] Seek to {target} "
-                            f"({seconds:.1f}s/{self._track_duration:.1f}s)"
-                        )
+
+            # 然后在锁内修改状态
+            async with self._lock:
+                if seek_url:
+                    log.info(
+                        f"[{self.friendly_name}] Seek to {target} "
+                        f"({seconds:.1f}s/{self._track_duration:.1f}s)"
+                    )
+                    
+                    # 保存当前状态，以便在暂停状态下恢复
+                    was_playing = self.transport_state == TRANSPORT_STATE_PLAYING
+                    was_paused = self.transport_state == TRANSPORT_STATE_PAUSED
+                    
+                    self.transport_state = TRANSPORT_STATE_TRANSITIONING
+                    
+                    # 如果当前正在播放，先停止
+                    if was_playing:
+                        await self.speaker.stop()
+                    
+                    success = await self.speaker.play_url(seek_url)
+                    if success:
+                        self._accumulated_time = seconds
                         
-                        # 保存当前状态，以便在暂停状态下恢复
-                        was_playing = self.transport_state == TRANSPORT_STATE_PLAYING
-                        was_paused = self.transport_state == TRANSPORT_STATE_PAUSED
-                        
-                        self.transport_state = TRANSPORT_STATE_TRANSITIONING
-                        
-                        # 如果当前正在播放，先停止
-                        if was_playing:
-                            await self.speaker.stop()
-                        
-                        success = await self.speaker.play_url(seek_url)
-                        if success:
-                            self._accumulated_time = seconds
-                            
-                            # 如果之前是暂停状态，seek后暂停在当前位置
-                            if was_paused:
-                                await self.speaker.pause()
-                                self._play_start_time = 0.0
-                                self.transport_state = TRANSPORT_STATE_PAUSED
-                                log.info(f"[{self.friendly_name}] Seek 成功（保持暂停）")
-                            else:
-                                self._play_start_time = time.time()
-                                self.transport_state = TRANSPORT_STATE_PLAYING
-                                log.info(f"[{self.friendly_name}] Seek 成功")
+                        # 如果之前是暂停状态，seek后暂停在当前位置
+                        if was_paused:
+                            await self.speaker.pause()
+                            self._play_start_time = 0.0
+                            self.transport_state = TRANSPORT_STATE_PAUSED
+                            log.info(f"[{self.friendly_name}] Seek 成功（保持暂停）")
                         else:
-                            self.transport_state = TRANSPORT_STATE_STOPPED
-                            log.error(f"[{self.friendly_name}] Seek 播放失败")
-                        # 在锁外发送通知
-                        asyncio.get_running_loop().create_task(self.notify_state_change())
-                        return success
+                            self._play_start_time = time.time()
+                            self.transport_state = TRANSPORT_STATE_PLAYING
+                            log.info(f"[{self.friendly_name}] Seek 成功")
+                    else:
+                        self.transport_state = TRANSPORT_STATE_STOPPED
+                        log.error(f"[{self.friendly_name}] Seek 播放失败")
+                    # 在锁外发送通知
+                    asyncio.get_running_loop().create_task(self.notify_state_change())
+                    return success
 
                 # 回退: 软 Seek（仅更新内部位置追踪）
                 self._accumulated_time = seconds
@@ -312,10 +325,10 @@ class DLNARenderer:
                     self._play_start_time = time.time()
                 log.info(f"[{self.friendly_name}] Seek to {target} (soft)")
                 return True
-            elif unit == "TRACK_NR":
-                log.info(f"[{self.friendly_name}] Seek TRACK_NR={target} (ignored)")
-                return True
-            return False
+        elif unit == "TRACK_NR":
+            log.info(f"[{self.friendly_name}] Seek TRACK_NR={target} (ignored)")
+            return True
+        return False
 
     async def next_track(self):
         """播放下一曲"""

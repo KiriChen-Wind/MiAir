@@ -179,10 +179,12 @@ class SpeakerAirPlay:
                     if self.airplay_server and not self.airplay_server.is_playing:
                         break
 
-                    # 重新播放
-                    log.info(f"[{self.device_name}] AirPlay 自动续播: {self._stream_url}")
+                    # 重新播放（使用新 URL 防止音箱缓存旧响应）
+                    base_url = self._stream_url.split('?')[0]
+                    fresh_url = f"{base_url}?sid={int(time.time())}"
+                    log.info(f"[{self.device_name}] AirPlay 自动续播: {fresh_url}")
                     self._play_grace_until = time.time() + 10.0
-                    success = await self.controller.play_url(self._stream_url)
+                    success = await self.controller.play_url(fresh_url)
                     if success:
                         log.info(f"[{self.device_name}] AirPlay 续播成功")
                     else:
