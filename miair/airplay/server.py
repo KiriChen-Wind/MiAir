@@ -155,6 +155,7 @@ class AirPlayServer:
         self._last_volume_db: float = -15.0  # 默认音量
         self._client_name: str = ""  # 连接的客户端设备名称
         self._is_playing: bool = False # 是否正在播放
+        self._loop: asyncio.AbstractEventLoop | None = None  # 事件循环引用（用于跨线程回调）
 
     def _generate_device_id(self) -> str:
         """生成设备 MAC 地址格式的 ID
@@ -199,6 +200,9 @@ class AirPlayServer:
 
     async def start(self):
         """启动 AirPlay 服务"""
+        # 保存事件循环引用，供 RTSP 线程安全回调使用
+        self._loop = asyncio.get_running_loop()
+
         # 启动音频流 HTTP 服务器
         await self._stream_server.start()
         self.stream_port = self._stream_server.port
@@ -250,22 +254,17 @@ class AirPlayServer:
     def _safe_call_on_play_stop(self):
         """线程安全地调用 on_play_stop 回调
         
-        从同步线程中安全地触发可能涉及异步操作的回调。
+        从同步 RTSP 线程中安全地触发可能涉及异步操作的回调。
+        使用 start() 时保存的事件循环引用，避免 Python 3.12 中
+        asyncio.get_event_loop() 在非主线程不可靠的问题。
         """
         if not self.on_play_stop:
             return
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.call_soon_threadsafe(self.on_play_stop)
+            if self._loop and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self.on_play_stop)
             else:
                 self.on_play_stop()
-        except RuntimeError:
-            # 没有事件循环，直接调用
-            try:
-                self.on_play_stop()
-            except Exception as e:
-                log.error(f"on_play_stop error: {e}")
         except Exception as e:
             log.error(f"on_play_stop error: {e}")
 

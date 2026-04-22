@@ -155,7 +155,9 @@ class SpeakerAirPlay:
                     continue
 
                 try:
-                    status = await self.controller.get_status()
+                    status = await asyncio.wait_for(
+                        self.controller.get_status(), timeout=10
+                    )
                     speaker_status = status.get("status", 0)
                     # status: 0=stopped, 1=playing, 2=paused
                     if speaker_status == 1:

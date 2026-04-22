@@ -109,13 +109,16 @@ class DeviceServer:
         self.app.router.add_get("/media/{token}", self._handle_media_proxy)
 
     def _get_proxy_session(self) -> aiohttp.ClientSession:
-        """获取/创建用于下载的持久 session，带连接池限制"""
+        """获取/创建用于下载的持久 session，带连接池限制和超时"""
         if not self._proxy_session or self._proxy_session.closed:
             connector = aiohttp.TCPConnector(
                 limit=50,  # 连接池上限（默认100太大，10太小会卡住多线程下载）
                 ttl_dns_cache=300,  # DNS 缓存 5 分钟
             )
-            self._proxy_session = aiohttp.ClientSession(connector=connector)
+            self._proxy_session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=120, connect=10, sock_read=60)
+            )
         return self._proxy_session
 
     def register_renderer(self, renderer: DLNARenderer):
@@ -832,10 +835,10 @@ class DeviceServer:
         try:
             import tempfile
             
-            # 写入临时输入文件（ffmpeg 可以 seek 输入，比 pipe 更可靠）
+            # 写入临时输入文件（异步避免大文件写入阻塞事件循环）
             with tempfile.NamedTemporaryFile(suffix='.input', delete=False) as f:
                 input_path = f.name
-                f.write(buf.data)
+            await asyncio.to_thread(self._write_file, input_path, buf.data)
             output_path = input_path + '.wav'
             
             ffmpeg_path = self._check_ffmpeg() or 'ffmpeg'
@@ -888,8 +891,8 @@ class DeviceServer:
                 log.error("WAV 转码未产生输出文件")
                 return False
             
-            with open(output_path, 'rb') as f:
-                wav_data = f.read()
+            # 异步读取转码结果（避免大文件读取阻塞事件循环）
+            wav_data = await asyncio.to_thread(self._read_file, output_path)
             
             if not wav_data:
                 log.error("WAV 转码输出文件为空")
@@ -920,6 +923,18 @@ class DeviceServer:
                         pass
             buf._converting = False
             buf._convert_event.set()
+
+    @staticmethod
+    def _write_file(path: str, data: bytes | bytearray):
+        """写入文件（在线程池中执行，避免阻塞事件循环）"""
+        with open(path, 'wb') as f:
+            f.write(data)
+
+    @staticmethod
+    def _read_file(path: str) -> bytes:
+        """读取文件（在线程池中执行，避免阻塞事件循环）"""
+        with open(path, 'rb') as f:
+            return f.read()
 
     def _get_ffmpeg_input_format(self, content_type: str, remote_url: str = "") -> str:
         """根据Content-Type和URL获取ffmpeg输入格式"""
@@ -1174,7 +1189,9 @@ class DeviceServer:
                     if not renderer.speaker or not renderer.current_uri:
                         continue
                     try:
-                        status = await renderer.speaker.get_status()
+                        status = await asyncio.wait_for(
+                            renderer.speaker.get_status(), timeout=10
+                        )
                         await self._sync_renderer_state(udn, renderer, status)
                     except Exception as e:
                         log.warning(

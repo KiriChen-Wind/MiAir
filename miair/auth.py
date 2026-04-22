@@ -41,9 +41,11 @@ class AuthManager:
         """登录小米账号并初始化服务"""
         os.makedirs(self.config.conf_path, exist_ok=True)
 
-        # 创建 aiohttp session
+        # 创建 aiohttp session（必须设置超时，否则 miservice HTTP 调用可能无限挂起导致卡死）
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
+            )
 
         token_store = self.config.mi_token_home
 
