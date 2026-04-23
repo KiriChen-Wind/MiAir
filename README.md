@@ -14,7 +14,7 @@
 python miair.py
 ```
 程序将自动安装相关依赖库，请确保网络畅通\
-安装完成后访问 `http://容器宿主机IP:8300` 即可打开 Web 管理界面。
+安装完成后访问 `http://主机IP:8300` 即可打开 Web 管理界面。
 
 ## Docker (Thanks @SyunSS)
 
