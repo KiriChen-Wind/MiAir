@@ -25,6 +25,7 @@ docker run -d \
   --name miair \
   --network=host \
   -e MIAIR_HOSTNAME=你的局域网IP \
+  -v /mnt/sata1-4/miair/conf:/app/conf \ #你需要存储配置文件的目录
   ghcr.io/syunss/miair:latest
 ```
 
