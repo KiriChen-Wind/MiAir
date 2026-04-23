@@ -38,7 +38,7 @@ chmod +x deploy.sh manage.sh
 
 ## 后续 可能 添加的功能
 
-- 支持 Docker 部署
+- ~~支持 Docker 部署~~
 - 支持 OpenWrt 部署
 - ~~支持 MacOS 部署~~
 - ......
