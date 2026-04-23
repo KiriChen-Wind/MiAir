@@ -36,10 +36,6 @@ chmod +x deploy.sh manage.sh
 ./deploy.sh
 ```
 
-安装完成后访问 `http://容器宿主机IP:8300` 即可打开 Web 管理界面。
-请确保容器网络为Host。\
-部分情况下，修改配置后容器可能无法自动重启，请手动重启容器。
-
 ### 在线镜像部署
 ```bash
 docker run -d \
@@ -60,6 +56,10 @@ docker build -t miair .
 docker run -d --name miair --network=host -e MIAIR_HOSTNAME=你的IP miair
 ```
 
+安装完成后访问 `http://容器宿主机IP:8300` 即可打开 Web 管理界面。
+请确保容器网络为Host。\
+部分情况下，修改配置后容器可能无法自动重启，请手动重启容器。
+
 ### Docker 相关命令
 ```bash
 docker logs -f miair     # 查看日志
@@ -67,7 +67,6 @@ docker stop miair        # 停止
 docker start miair       # 启动
 docker restart miair     # 重启
 ```
-
 
 ## 我们
 **[需要帮助&交流&测试版本发布](https://qun.qq.com/universal-share/share?ac=1&authKey=1zXhx2zxgw9GG2mkecypT9clD7q0B3W3l4K0D4fQirmpDWakz0Oy2BI3ocDrgzbh&busi_data=eyJncm91cENvZGUiOiI3NDEyNjcyOTgiLCJ0b2tlbiI6InYwbitXQTF5cE9MaUJCR0hMUk03OWV0WkFoMThxbjJRaWI4dHVlbUpGdW5OdEZBVEpXMXF0T1dQUnRmRXRzYVgiLCJ1aW4iOiIxODQxOTM4MDQwIn0%3D&data=_OrA-eASJMwYwx-Uj-BReC1Xh3zGAdkn8CQskbEsQ5S66bhqvvO6dJ-QrSlRl-Ks00l5XDw1FANE8Um0w5yB8Q&svctype=4&tempid=h5_group_info "需要帮助&交流&测试版本发布")**
