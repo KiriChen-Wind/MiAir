@@ -149,7 +149,6 @@ fi
 # ============================================
 # 步骤 4: 配置参数
 # ============================================
-echo -e "${GREEN}[4/8] 配置 MiAir 参数...${NC}"
 
 # 加载 .env 文件（如果存在）
 if [ -f ".env" ]; then
@@ -158,26 +157,6 @@ if [ -f ".env" ]; then
     source .env
     set +a
 fi
-
-# 交互式输入（如果没有设置环境变量）
-if [ -z "$MI_USER" ]; then
-    echo ""
-    echo -n "请输入小米账号 (手机号/邮箱): "
-    read -r MI_USER
-fi
-
-if [ -z "$MI_PASS" ]; then
-    echo -n "请输入小米密码: "
-    read -r -s MI_PASS
-    echo ""
-fi
-
-if [ -z "$MI_DID" ]; then
-    echo -n "请输入设备 DID (留空自动搜索): "
-    read -r MI_DID
-fi
-
-echo -e "${GREEN}✓ 参数配置完成${NC}"
 
 # ============================================
 # 步骤 5: 创建 Dockerfile
@@ -280,7 +259,7 @@ if [ $? -eq 0 ]; then
     echo -e "${GREEN}  🎉 MiAir 部署成功！${NC}"
     echo "=========================================="
     echo ""
-    echo -e "Web 管理界面: ${GREEN}http://$HOST_IP:8300${NC}"
+    echo -e "Web 管理界面: ${GREEN}YourHostIP:8300${NC}"
     echo -e "DLNA 端口: ${GREEN}8200${NC}"
     echo ""
     echo "查看日志命令:"
