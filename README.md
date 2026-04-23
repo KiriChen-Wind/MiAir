@@ -25,7 +25,7 @@ opkg install git-http
 git clone -b docker https://github.com/KiriChen-Wind/MiAir.git
 cd MiAir
 
-# 运行安装脚本，按提示输入小米账号密码即可
+# 赋予权限并运行安装脚本
 chmod +x deploy.sh manage.sh
 ./deploy.sh
 ```
