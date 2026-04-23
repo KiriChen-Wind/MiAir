@@ -8,7 +8,7 @@
 ### Windows
 *确保设备已安装 Python 3.12+*
 
-前往Release页面下载最新版本
+前往Release页面下载最新版本\
 进入项目目录，使用终端执行
 ```python
 python miair.py
