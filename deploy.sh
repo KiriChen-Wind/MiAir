@@ -175,7 +175,7 @@ fi
 
 # 创建 Dockerfile
 cat > Dockerfile << 'DOCKERFILE_EOF'
-FROM python:3.12-slim
+FROM m.daocloud.io/docker.io/library/python:3.12-slim
 
 LABEL maintainer="MiAir"
 LABEL description="DLNA/AirPlay receiver for Xiaomi AI Speaker"
