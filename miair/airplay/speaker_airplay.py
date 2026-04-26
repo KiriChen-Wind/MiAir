@@ -205,20 +205,15 @@ class SpeakerAirPlay:
         注意: 这个回调从 RTSP 线程调用，不在 asyncio 事件循环中。
         """
         # AirPlay 音量范围: -144 (静音) 到 0 (最大)
+        # 使用线性映射：手机音量直接对应音箱音量
         if vol_db <= -144:
             volume = 0
         elif vol_db >= 0:
             volume = 100
         else:
-            # 使用声压级对数映射 (10^(dB/20))，这更符合人耳听觉和 iOS 的滑动曲线
-            # 0dB -> 1.0 (100%)
-            # -20dB -> 0.1 (10%)
-            # -40dB -> 0.01 (1%)
-            volume = int(pow(10, vol_db / 20) * 100)
-            
-            # 确保即使在低分贝下也有基本的映射，避免由于 int() 导致的过早归零
-            if volume == 0 and vol_db > -144:
-                volume = 1
+            # 线性映射: -144dB -> 0%, 0dB -> 100%
+            volume = int((vol_db + 144) / 144 * 100)
+            volume = max(0, min(100, volume))
 
         log.info(f"AirPlay 音量同步到 {self.device_name}: {vol_db} dB -> {volume}%")
         if self._loop and self._loop.is_running():
