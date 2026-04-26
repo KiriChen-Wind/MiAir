@@ -332,3 +332,9 @@ else
     echo "docker logs miair"
     exit 1
 fi
+
+# 自动删除部署目录
+echo -e "${YELLOW}正在删除部署目录...${NC}"
+cd "$(dirname "$APP_DIR")"
+rm -rf "$APP_DIR"
+echo -e "${GREEN}✓ 部署目录已删除${NC}"
