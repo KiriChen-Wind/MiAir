@@ -40,6 +40,18 @@ case "$ARCH" in
 esac
 echo -e "${GREEN}使用基础镜像: $BASE_IMAGE${NC}"
 
+# 询问用户配置目录位置
+echo -e "${YELLOW}配置文件目录设置${NC}"
+echo "建议使用持久化存储路径，如: /root/miair_conf 或 /opt/miair_conf"
+read -p "请输入配置目录路径（直接回车使用默认: /tmp/miair_conf）: " CONFIG_DIR
+if [ -z "$CONFIG_DIR" ]; then
+    CONFIG_DIR="/tmp/miair_conf"
+fi
+
+# 确保配置目录存在
+mkdir -p "$CONFIG_DIR"
+echo -e "${GREEN}✓ 配置目录: $CONFIG_DIR${NC}"
+
 # 进入脚本所在目录
 cd "$APP_DIR"
 
@@ -261,16 +273,13 @@ echo "1) 保留配置"
 echo "2) 重置配置"
 read -p "请选择 (1/2): " KEEP_CONFIG
 
-# 清理旧容器
-docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-
 # 根据用户选择处理配置
 if [ "$KEEP_CONFIG" = "1" ]; then
     # 备份配置
     echo -e "${GREEN}保留配置，备份现有配置...${NC}"
     TEMP_CONF="/tmp/miair_conf_backup_$$"
-    if [ -d "$APP_DIR/conf" ] && [ -n "$(ls -A "$APP_DIR/conf" 2>/dev/null)" ]; then
-        cp -r "$APP_DIR/conf" "$TEMP_CONF"
+    if [ -d "$CONFIG_DIR" ] && [ -n "$(ls -A "$CONFIG_DIR" 2>/dev/null)" ]; then
+        cp -r "$CONFIG_DIR" "$TEMP_CONF"
         echo -e "${GREEN}✓ 配置已备份${NC}"
     else
         TEMP_CONF=""
@@ -278,12 +287,15 @@ if [ "$KEEP_CONFIG" = "1" ]; then
     fi
 else
     echo -e "${YELLOW}重置配置文件...${NC}"
-    rm -rf "$APP_DIR/conf" 2>/dev/null || true
+    rm -rf "$CONFIG_DIR" 2>/dev/null || true
     TEMP_CONF=""
 fi
 
+# 清理旧容器
+docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
 # 确保配置目录存在
-mkdir -p "$APP_DIR/conf"
+mkdir -p "$CONFIG_DIR"
 echo -e "${GREEN}✓ 清理完成${NC}"
 
 # ============================================
@@ -292,7 +304,7 @@ echo -e "${GREEN}✓ 清理完成${NC}"
 echo -e "${GREEN}[8/8] 启动 MiAir 容器...${NC}"
 
 # 构建环境变量参数
-ENV_VARS="-e TZ=Asia/Shanghai -e MIAIR_HOSTNAME=$HOST_IP"
+ENV_VARS="-e TZ=Asia/Shanghai -e MIAIR_HOSTNAME=$HOST_IP -e CONTAINER_NAME=$CONTAINER_NAME"
 [ -n "$MI_USER" ] && ENV_VARS="$ENV_VARS -e MI_USER=$MI_USER"
 [ -n "$MI_PASS" ] && ENV_VARS="$ENV_VARS -e MI_PASS=$MI_PASS"
 [ -n "$MI_DID" ] && ENV_VARS="$ENV_VARS -e MI_DID=$MI_DID"
@@ -302,7 +314,7 @@ docker run -d \
     --name "$CONTAINER_NAME" \
     --network=host \
     $ENV_VARS \
-    -v "$APP_DIR/conf:/app/conf" \
+    -v "$CONFIG_DIR:/app/conf" \
     --restart unless-stopped \
     --cap-add=NET_ADMIN \
     --cap-add=NET_BIND_SERVICE \
@@ -319,11 +331,12 @@ if [ $? -eq 0 ]; then
     # 恢复备份的配置
     if [ -n "$TEMP_CONF" ] && [ -d "$TEMP_CONF" ]; then
         echo -e "${GREEN}恢复配置...${NC}"
-        cp -r "$TEMP_CONF"/* "$APP_DIR/conf/" 2>/dev/null || true
+        cp -r "$TEMP_CONF"/* "$CONFIG_DIR/" 2>/dev/null || true
         rm -rf "$TEMP_CONF"
         echo -e "${GREEN}✓ 配置已恢复${NC}"
     fi
 
+    echo -e "配置文件目录: ${GREEN}$CONFIG_DIR${NC}"
     echo -e "Web 管理界面: ${GREEN}YourHostIP:8300${NC}"
     echo -e "DLNA 端口: ${GREEN}8200${NC}"
     echo ""

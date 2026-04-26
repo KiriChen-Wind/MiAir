@@ -28,9 +28,51 @@ def _restart_process():
     
     # 检测是否在 Docker 容器中
     if _is_docker():
-        # Docker 环境下，直接退出进程，让 Docker 容器重启
-        log.info("在 Docker 环境中，退出进程以触发容器重启")
-        import os
+        # Docker 环境下，使用 docker restart 重启容器
+        log.info("在 Docker 环境中，使用 docker restart 重启容器")
+        import subprocess
+        
+        # 优先使用容器名称（deploy.sh 中设置为 miair）
+        container_name = os.environ.get("CONTAINER_NAME", "miair")
+        
+        try:
+            # 尝试使用 docker restart 重启容器
+            result = subprocess.run(
+                ["docker", "restart", container_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                log.info(f"容器 {container_name} 重启命令已发送")
+                return
+            else:
+                log.warning(f"docker restart 失败: {result.stderr}, 尝试使用容器ID")
+        except FileNotFoundError:
+            log.warning("docker 命令不可用，尝试直接退出进程")
+        except subprocess.TimeoutExpired:
+            log.error("docker restart 命令执行超时")
+        except Exception as e:
+            log.warning(f"docker restart 出错: {e}")
+        
+        # 如果 docker restart 失败，尝试使用容器ID（从 /proc/self/cgroup 获取）
+        try:
+            with open('/proc/1/cgroup', 'r') as f:
+                cgroup_content = f.read()
+                # 提取容器ID（格式通常是 12:devices:/docker/xxxxxxxxxxxx）
+                import re
+                match = re.search(r'/docker/([a-f0-9]{64})', cgroup_content)
+                if match:
+                    container_id = match.group(1)[:12]  # 取短ID
+                    subprocess.run(["docker", "restart", container_id], check=True, timeout=30)
+                    log.info(f"容器 {container_id} 重启命令已发送")
+                    return
+        except Exception as e:
+            log.error(f"获取容器ID失败: {e}")
+        
+        # 最后尝试直接退出进程
+        log.warning("无法使用 docker restart，尝试直接退出进程")
         os._exit(1)
     elif sys.platform == "win32":
         # Windows 上 os.execv 行为不同，使用 subprocess 重启
