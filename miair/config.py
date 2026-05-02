@@ -67,7 +67,7 @@ class Config:
     auto_resume_on_interrupt: bool = False
     resume_delay_seconds: int = 5
     # 默认音量 (1-100)
-    default_volume: int = 50
+    default_volume: int = 38
     # 实验性功能：跟随设备当前音量
     follow_device_volume: bool = False
     # 语音控制
