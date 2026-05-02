@@ -89,6 +89,9 @@ def create_web_app(config: Config, app_instance) -> web.Application:
             # 实验性功能
             "auto_resume_on_interrupt": config.auto_resume_on_interrupt,
             "resume_delay_seconds": config.resume_delay_seconds,
+            "default_volume": config.default_volume,
+            "follow_device_volume": config.follow_device_volume,
+            "auto_restart": config.auto_restart,
         }
 
         # 返回已配置的 speakers 信息
@@ -140,7 +143,13 @@ def create_web_app(config: Config, app_instance) -> web.Application:
         if "auto_resume_on_interrupt" in data:
             config.auto_resume_on_interrupt = data["auto_resume_on_interrupt"]
         if "resume_delay_seconds" in data:
-            config.resume_delay_seconds = data["resume_delay_seconds"]
+            config.resume_delay_seconds = max(1, min(15, int(data["resume_delay_seconds"])))
+        if "default_volume" in data:
+            config.default_volume = max(1, min(100, int(data["default_volume"])))
+        if "follow_device_volume" in data:
+            config.follow_device_volume = data["follow_device_volume"]
+        if "auto_restart" in data:
+            config.auto_restart = data["auto_restart"]
 
         # 更新 speaker 名称
         if "speakers" in data:

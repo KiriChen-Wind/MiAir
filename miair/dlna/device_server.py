@@ -1069,6 +1069,9 @@ class DeviceServer:
         if not renderer:
             return web.Response(status=404, text="Device not found")
 
+        # 记录最后活动时间
+        renderer._last_control_time = time.time()
+
         # 解析 SOAPAction
         soap_action = request.headers.get("SOAPAction", "")
         if not soap_action:
@@ -1098,6 +1101,11 @@ class DeviceServer:
         event_manager = self.event_managers.get(udn)
         if not event_manager:
             return web.Response(status=404)
+
+        # 记录活动时间（续订或新订阅都说明控制端仍在连接）
+        renderer = self.renderers.get(udn)
+        if renderer:
+            renderer._last_control_time = time.time()
 
         # 检查是否是续订 (有 SID header)
         sid = request.headers.get("SID", "")
@@ -1186,7 +1194,44 @@ class DeviceServer:
             while True:
                 await asyncio.sleep(5)
                 for udn, renderer in self.renderers.items():
-                    if not renderer.speaker or not renderer.current_uri:
+                    if not renderer.speaker:
+                        continue
+
+                    # 检测控制端断开：渲染器处于终端状态（PAUSED/STOPPED）且有媒体URI
+                    # 1. PAUSED 振荡：音箱 STOP 但被强制保持 PAUSED 超过 30 秒
+                    #    语音打断场景（_user_stopped=False）：直接重置
+                    #    用户手动暂停（_user_stopped=True）：需确认无订阅者后重置
+                    # 2. STOPPED 持久：有 URI 但无控制活动超过 60 秒且无订阅者
+                    idle = False
+                    if (
+                        renderer.current_uri
+                        and renderer.transport_state == TRANSPORT_STATE_PAUSED
+                        and renderer._stuck_paused_since > 0
+                        and (time.time() - renderer._stuck_paused_since) > 30
+                    ):
+                        if not renderer._user_stopped:
+                            idle = True
+                        elif (
+                            renderer.event_manager
+                            and not renderer.event_manager.has_subscribers()
+                        ):
+                            idle = True
+                    elif (
+                        renderer.current_uri
+                        and renderer.transport_state == TRANSPORT_STATE_STOPPED
+                        and renderer._last_control_time > 0
+                        and (time.time() - renderer._last_control_time) > 60
+                        and renderer.event_manager
+                        and not renderer.event_manager.has_subscribers()
+                    ):
+                        idle = True
+
+                    if idle:
+                        await renderer.reset_to_idle()
+                        renderer._stuck_paused_since = 0.0
+                        continue
+
+                    if not renderer.current_uri:
                         continue
                     try:
                         status = await asyncio.wait_for(
@@ -1264,7 +1309,15 @@ class DeviceServer:
             renderer._play_start_time = 0.0
             renderer.transport_state = TRANSPORT_STATE_PAUSED
 
-            if self.config and self.config.auto_resume_on_interrupt:
+            if renderer._stuck_paused_since == 0.0:
+                renderer._stuck_paused_since = time.time()
+
+            if (
+                self.config
+                and self.config.auto_resume_on_interrupt
+                and not renderer._user_stopped
+                and (time.time() - renderer._stuck_paused_since) < 15
+            ):
                 if udn in self._resume_tasks:
                     self._resume_tasks[udn].cancel()
                 delay = self.config.resume_delay_seconds

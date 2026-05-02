@@ -25,10 +25,11 @@ log = logging.getLogger("miair")
 class DLNARenderer:
     """每个音箱对应一个 DLNA 渲染器实例，管理传输状态"""
 
-    def __init__(self, udn: str, friendly_name: str, speaker: SpeakerController):
+    def __init__(self, udn: str, friendly_name: str, speaker: SpeakerController, default_volume: int = 50, config=None):
         self.udn = udn
         self.friendly_name = friendly_name
         self.speaker = speaker
+        self.config = config
         # 保存did以便快速访问
         self.did = speaker.did
         self._lock = asyncio.Lock()
@@ -41,9 +42,9 @@ class DLNARenderer:
         self.play_speed = "1"
 
         # 音量/静音
-        self.volume = 50
+        self.volume = default_volume
         self.mute = False
-        self._pre_mute_volume = 50
+        self._pre_mute_volume = default_volume
 
         # 事件管理器 (由 DeviceServer 注入)
         self.event_manager = None
@@ -69,6 +70,13 @@ class DLNARenderer:
         self._play_check_task: asyncio.Task | None = None
         # play() 后的宽限期，在此时间之前轮询不覆盖 PLAYING 状态
         self._play_grace_until: float = 0.0
+        # 用户主动暂停/停止标志：True 表示用户手动暂停/停止，不应自动续播
+        self._user_stopped: bool = False
+        # 最后一次接收 DLNA 控制命令的时间（用于检测控制端断开）
+        self._last_control_time: float = 0.0
+        # 检测 "音箱已停而渲染器被强制保持PAUSED" 的起始时间
+        # 当此模式持续超过阈值时，判定控制端已断开并重置为空闲
+        self._stuck_paused_since: float = 0.0
 
     # 视频格式扩展名列表
     VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.m4v', '.3gp', '.ts', '.mts', '.m2ts'}
@@ -161,6 +169,8 @@ class DLNARenderer:
                 self._play_check_task = None
 
             self.transport_state = TRANSPORT_STATE_TRANSITIONING
+            self._user_stopped = False
+            self._stuck_paused_since = 0.0
             log.info(f"[{self.friendly_name}] Play: {self.current_uri}")
 
             # 计算当前播放位置（用于从暂停位置继续播放）
@@ -207,12 +217,32 @@ class DLNARenderer:
                     self._play_grace_until = time.time() + 8.0
                 log.info(f"[{self.friendly_name}] 播放成功")
                 self._play_check_task = asyncio.create_task(self._check_play_status())
+                asyncio.create_task(self._apply_default_volume())
             else:
                 self.transport_state = TRANSPORT_STATE_STOPPED
                 self._play_grace_until = 0.0
                 log.error(f"[{self.friendly_name}] 播放失败")
         await self.notify_state_change()
         return success
+
+    async def _apply_default_volume(self):
+        """播放开始后应用默认音量"""
+        try:
+            if getattr(self.config, 'follow_device_volume', False):
+                return
+            
+            default_vol = getattr(self.config, 'default_volume', 50)
+            if default_vol <= 0:
+                return
+                
+            await asyncio.sleep(0.5)
+            if self.speaker:
+                await self.speaker.set_volume(default_vol)
+                self.volume = default_vol
+                log.info(f"[{self.friendly_name}] 已应用默认音量: {default_vol}%")
+                await self.notify_state_change()
+        except Exception as e:
+            log.error(f"[{self.friendly_name}] 应用默认音量失败: {e}")
 
     async def pause(self) -> bool:
         """暂停播放 (DLNA Pause)"""
@@ -227,6 +257,7 @@ class DLNARenderer:
                     self._accumulated_time += time.time() - self._play_start_time
                     self._play_start_time = 0.0
                 self.transport_state = TRANSPORT_STATE_PAUSED
+                self._user_stopped = True
                 # 取消播放状态检查任务
                 if self._play_check_task:
                     self._play_check_task.cancel()
@@ -250,6 +281,7 @@ class DLNARenderer:
                 self.transport_state = TRANSPORT_STATE_STOPPED
                 self._accumulated_time = 0.0
                 self._play_start_time = 0.0
+                self._user_stopped = True
                 # 取消播放状态检查任务
                 if self._play_check_task:
                     self._play_check_task.cancel()
@@ -257,6 +289,28 @@ class DLNARenderer:
                 log.info(f"[{self.friendly_name}] 已停止")
         await self.notify_state_change()
         return success
+
+    async def reset_to_idle(self):
+        """重置为空闲状态（控制端断开连接后调用）"""
+        async with self._lock:
+            if self.transport_state == TRANSPORT_STATE_NO_MEDIA:
+                return
+            old_state = self.transport_state
+            self.transport_state = TRANSPORT_STATE_NO_MEDIA
+            self.current_uri = ""
+            self.current_uri_metadata = ""
+            self.next_uri = ""
+            self.next_uri_metadata = ""
+            self._accumulated_time = 0.0
+            self._play_start_time = 0.0
+            self._track_duration = 0.0
+            self._user_stopped = False
+            self._stuck_paused_since = 0.0
+            if self._play_check_task:
+                self._play_check_task.cancel()
+                self._play_check_task = None
+            log.info(f"[{self.friendly_name}] 控制端断开，重置为空闲 ({old_state})")
+        await self.notify_state_change()
 
     async def seek(self, unit: str, target: str) -> bool:
         """Seek - 生成格式正确的 seeked 音频并重新播放

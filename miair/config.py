@@ -66,8 +66,14 @@ class Config:
     # 实验性功能：打断后续播
     auto_resume_on_interrupt: bool = False
     resume_delay_seconds: int = 5
+    # 默认音量 (1-100)
+    default_volume: int = 50
+    # 实验性功能：跟随设备当前音量
+    follow_device_volume: bool = False
     # 语音控制
     enable_voice_control: bool = False
+    # 自动重启（当登录失败或服务异常时）
+    auto_restart: bool = True
     voice_poll_interval: int = 1
     speakers: dict = field(default_factory=dict)
 
@@ -80,6 +86,7 @@ class Config:
         return os.path.join(self.conf_path, "miair.log")
 
     def __post_init__(self):
+        self.resume_delay_seconds = max(1, min(15, self.resume_delay_seconds))
         if not self.account:
             self.account = os.getenv("MI_USER", "")
         if not self.password:

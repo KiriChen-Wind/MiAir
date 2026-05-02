@@ -94,12 +94,37 @@ class SpeakerAirPlay:
             success = await self.controller.play_url(stream_url)
             if success:
                 log.info(f"AirPlay 音频已在 {self.device_name} 开始播放")
-                # 启动状态轮询（打断续播）
                 self._start_poll()
+                if self.config:
+                    default_vol = getattr(self.config, 'default_volume', 0)
+                    follow_dev_vol = getattr(self.config, 'follow_device_volume', False)
+                    if follow_dev_vol:
+                        try:
+                            current_vol = await self.controller.get_volume()
+                            if self.airplay_server:
+                                self.airplay_server._last_volume_db = self._vol_pct_to_db(current_vol)
+                            log.info(f"AirPlay 已跟随设备当前音量到 {self.device_name}: {current_vol}%")
+                        except Exception as e:
+                            log.error(f"AirPlay 获取当前音量失败: {e}")
+                    elif default_vol > 0:
+                        await asyncio.sleep(0.5)
+                        await self.controller.set_volume(default_vol)
+                        if self.airplay_server:
+                            self.airplay_server._last_volume_db = self._vol_pct_to_db(default_vol)
+                        log.info(f"AirPlay 已应用默认音量到 {self.device_name}: {default_vol}%")
             else:
                 log.warning(f"AirPlay 音频在 {self.device_name} 播放失败")
         except Exception as e:
             log.error(f"AirPlay 播放到 {self.device_name} 失败: {e}")
+
+    @staticmethod
+    def _vol_pct_to_db(volume: int) -> float:
+        import math
+        if volume <= 0:
+            return -144.0
+        if volume >= 100:
+            return 0.0
+        return 20.0 * math.log10(volume / 100.0)
 
     def _on_play_stop(self):
         """AirPlay 停止播放

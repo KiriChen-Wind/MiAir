@@ -78,6 +78,10 @@ class EventManager:
             return True
         return False
 
+    def has_subscribers(self) -> bool:
+        """检查是否有未过期的订阅者"""
+        return any(not sub.expired for sub in self._subscriptions.values())
+
     async def notify_all(self, event_xml: str):
         """向所有活跃订阅者发送事件通知 (fire-and-forget，不等待慢订阅者)"""
         expired_sids = []

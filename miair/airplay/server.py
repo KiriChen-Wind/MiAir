@@ -407,6 +407,9 @@ class AirPlayServer:
                     })
                     sock.sendall(vol_body)
 
+                elif method == "SET_VOLUME_NOTIFICATION":
+                    self._send_rtsp_response(sock, 200, cseq)
+
                 elif method == "SET_PARAMETER":
                     content_type = headers.get("Content-Type", "")
                     log.info(f"SET_PARAMETER: Content-Type={content_type}, body size={len(body)}")

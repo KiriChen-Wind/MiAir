@@ -125,7 +125,7 @@ class MiAir:
                 udn = speaker.udn
                 friendly_name = speaker.get_dlna_name()
 
-                renderer = DLNARenderer(udn, friendly_name, controller)
+                renderer = DLNARenderer(udn, friendly_name, controller, self.config.default_volume, config=self.config)
                 self.renderers[udn] = renderer
                 self._did_to_udn[did] = udn
 

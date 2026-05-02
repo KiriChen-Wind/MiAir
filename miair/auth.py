@@ -122,6 +122,13 @@ class AuthManager:
                     )
                 else:
                     log.error(f"登录失败: {e}")
+                
+                # 如果开启了自动重启，则在严重错误时尝试重启程序
+                if self.config.auto_restart:
+                    log.warning("检测到登录失败，正在尝试自动重启程序以恢复服务...")
+                    from miair.web.api import _restart_process
+                    import asyncio
+                    asyncio.get_running_loop().call_later(5, _restart_process)
 
         # 无论是否登录成功，都设置 service (方便后续重试)
         self.mina_service = MiNAService(self.account)
