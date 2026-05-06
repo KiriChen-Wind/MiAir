@@ -40,6 +40,7 @@ NEED_USE_PLAY_MUSIC_API = [
     "X8F",
     "X4B",
     "LX05",
+    "LX05A",
     "OH2",
     "OH2P",
     "X6A",
