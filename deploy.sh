@@ -97,24 +97,39 @@ done
 # ============================================
 echo -e "${GREEN}[2/8] 获取局域网 IP...${NC}"
 
-# 获取 LAN 口 IP 的函数：按优先级依次尝试各种方式
+# 获取 LAN 口 IP 的函数：优先枚举局域网私有地址，默认出网地址只作为最后兜底
 get_lan_ip() {
     local ip
 
-    # 1. 尝试使用 awk 解析默认出网 IP (兼容绝大多数环境，包括 BusyBox/OpenWrt)
-    ip=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
+    # 1. 优先从非虚拟接口中选择私有 LAN 地址，避免多网卡时误选 WAN/default route
+    ip=$(ip -o -4 addr show scope global 2>/dev/null | awk '
+        $2 !~ /^(lo|docker[0-9]*|tailscale[0-9]*|veth.*|br-[a-f0-9]+|wg[0-9]*|tun[0-9]*|tap[0-9]*|ppp[0-9]*)$/ {
+            split($4, a, "/"); candidate=a[1]
+            if (candidate ~ /^192\.168\./) { best=candidate; found=1; exit }
+            if (candidate ~ /^10\./ && best == "") best=candidate
+            if (candidate ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./ && best == "") best=candidate
+            if (fallback == "") fallback=candidate
+        }
+        END { if (best != "") print best; else if (fallback != "") print fallback }
+    ')
     [ -n "$ip" ] && echo "$ip" && return
 
-
-    # 3. 没有默认路由时，兜底取第一个非 lo/docker/tailscale/veth/br-/wg/tun 的 IPv4
-    ip=$(ip -o -4 addr show scope global 2>/dev/null | awk '$2 !~ /^(lo|docker[0-9]*|tailscale[0-9]*|veth.*|br-[a-f0-9]+|wg[0-9]*|tun[0-9]*|tap[0-9]*)$/ {split($4, a, "/"); print a[1]; exit}')
-    [ -n "$ip" ] && echo "$ip" && return
-
-    # 4. 如果 ip 命令不可用，尝试 hostname -I
+    # 2. 如果 ip addr 不可用，再尝试 hostname -I 中的私有地址
     if command -v hostname &> /dev/null; then
-        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        ip=$(hostname -I 2>/dev/null | awk '{
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /^192\.168\./) { print $i; exit }
+                if ($i ~ /^10\./ && best == "") best=$i
+                if ($i ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./ && best == "") best=$i
+            }
+            if (best != "") print best
+        }')
         [ -n "$ip" ] && echo "$ip" && return
     fi
+
+    # 3. 最后才使用默认出网 IP，它可能是 WAN 地址，后续仍会要求用户确认
+    ip=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
+    [ -n "$ip" ] && echo "$ip" && return
 
     # 兜底
     echo "127.0.0.1"
