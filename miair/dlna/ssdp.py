@@ -1,5 +1,7 @@
 """SSDP 组播发现服务"""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import random
@@ -113,10 +115,17 @@ class SSDPServer:
         self._sock.bind(("", SSDP_PORT))
 
         # 加入组播组
+        multicast_interface = self._get_multicast_interface()
+        if multicast_interface:
+            self._sock.setsockopt(
+                socket.IPPROTO_IP,
+                socket.IP_MULTICAST_IF,
+                socket.inet_aton(multicast_interface),
+            )
         mreq = struct.pack(
             "4s4s",
             socket.inet_aton(SSDP_ADDR),
-            socket.inet_aton("0.0.0.0"),  # 使用INADDR_ANY
+            socket.inet_aton(multicast_interface or "0.0.0.0"),
         )
         self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         self._sock.setblocking(False)
@@ -132,7 +141,20 @@ class SSDPServer:
 
         # 启动定期 alive 任务
         self._alive_task = asyncio.create_task(self._periodic_alive())
-        log.info(f"SSDP 服务已启动 (监听 {SSDP_ADDR}:{SSDP_PORT})")
+        if multicast_interface:
+            log.info(f"SSDP 服务已启动 (监听 {SSDP_ADDR}:{SSDP_PORT}, 接口 {multicast_interface})")
+        else:
+            log.info(f"SSDP 服务已启动 (监听 {SSDP_ADDR}:{SSDP_PORT}, 接口自动选择)")
+
+    def _get_multicast_interface(self) -> str | None:
+        """返回 SSDP 组播使用的本地接口地址。"""
+        try:
+            socket.inet_aton(self.hostname)
+        except OSError:
+            return None
+        if self.hostname in ("0.0.0.0", "127.0.0.1"):
+            return None
+        return self.hostname
 
     async def stop(self):
         """停止 SSDP 服务"""

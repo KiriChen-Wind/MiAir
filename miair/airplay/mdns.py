@@ -12,6 +12,8 @@ import time
 from zeroconf import ServiceInfo, Zeroconf, IPVersion
 from zeroconf._exceptions import ServiceNameAlreadyRegistered, NonUniqueNameException
 
+from miair.config import Config
+
 log = logging.getLogger("miair")
 
 
@@ -39,9 +41,10 @@ class AirPlayMDNS:
     def _run_mdns(self):
         """在独立线程中运行 mDNS"""
         try:
-            # 获取本机 IP 地址 - 优先使用配置的 hostname，避免多网卡时选错
-            ip = self.hostname if self.hostname and self.hostname not in ("0.0.0.0", "127.0.0.1") else self._get_ip()
+            # mDNS 发布地址必须和 DLNA/AirPlay 流 URL 使用同一个配置 IP。
+            ip = self._get_ip()
             ip_bytes = socket.inet_aton(ip)
+            server_name = self._get_server_name()
 
             log.info(f"AirPlay mDNS 启动中，IP: {ip}:{self.rtsp_port}")
 
@@ -91,7 +94,7 @@ class AirPlayMDNS:
                 addresses=[ip_bytes],
                 port=self.rtsp_port,
                 properties=airplay_properties,
-                server=f"{self.hostname}.local.",
+                server=server_name,
             )
 
             # ===== RAOP 服务 (_raop._tcp) =====
@@ -121,7 +124,7 @@ class AirPlayMDNS:
                 addresses=[ip_bytes],
                 port=self.rtsp_port,
                 properties=raop_properties,
-                server=f"{self.hostname}.local.",
+                server=server_name,
             )
 
             # 只注册 RAOP 服务，强制 iOS 使用 AirPlay 1 (RAOP) 协议
@@ -183,16 +186,33 @@ class AirPlayMDNS:
             self._thread.join(timeout=2)
 
     def _get_ip(self) -> str:
-        """获取本机 IP 地址"""
+        """获取 mDNS 发布 IP，优先使用传入的统一 hostname。"""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
+            socket.inet_aton(self.hostname)
+            if self.hostname not in ("0.0.0.0", "127.0.0.1"):
+                return self.hostname
+        except OSError:
+            pass
+        return Config._detect_local_ip()
+
+    def _get_server_name(self) -> str:
+        """mDNS server 字段使用主机名，不能把 IP 拼成 192.168.x.x.local。"""
+        safe_device = re_safe_hostname(self.device_name)
+        device_id = self.device_id.replace(":", "").lower()
+        return f"miair-{safe_device[:40]}-{device_id}.local."
 
     def update_port(self, port: int):
         """更新 RTSP 端口（动态分配后调用）"""
         self.rtsp_port = port
+
+
+def re_safe_hostname(value: str) -> str:
+    """生成可用于 mDNS server 字段的 ASCII 主机名片段。"""
+    chars = []
+    for ch in value.lower():
+        if "a" <= ch <= "z" or "0" <= ch <= "9":
+            chars.append(ch)
+        elif chars and chars[-1] != "-":
+            chars.append("-")
+    hostname = "".join(chars).strip("-")
+    return hostname or "speaker"
