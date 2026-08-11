@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import logging
 import os
+import re
+import socket
+import subprocess
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
+
+
+log = logging.getLogger("miair")
 
 
 @dataclass
@@ -104,24 +112,183 @@ class Config:
             self.password = os.getenv("MI_PASS", "")
         if not self.mi_did:
             self.mi_did = os.getenv("MI_DID", "")
-        if not self.hostname:
-            self.hostname = os.getenv("MIAIR_HOSTNAME", "")
+        env_hostname = os.getenv("MIAIR_HOSTNAME", "").strip()
+        if env_hostname:
+            self.hostname = env_hostname
         if not self.hostname:
             self.hostname = self._detect_local_ip()
 
     @staticmethod
     def _detect_local_ip() -> str:
-        """自动检测本机局域网 IP"""
-        import socket
+        """自动检测本机局域网 IP，避免多网卡时误选默认 WAN 出口。"""
+        candidates = Config._collect_local_ipv4_candidates()
+        usable = []
+        seen = set()
+        for ip, source in candidates:
+            if ip in seen or not Config._is_usable_local_ipv4(ip):
+                continue
+            seen.add(ip)
+            usable.append((ip, source, Config._score_local_ipv4(ip, source)))
 
+        if usable:
+            usable.sort(key=lambda item: item[2], reverse=True)
+            selected = usable[0][0]
+            summary = ", ".join(f"{ip}({source})" for ip, source, _ in usable[:6])
+            log.info(f"自动检测局域网 IP: {selected}; 候选: {summary}")
+            return selected
+
+        ip = Config._detect_default_route_ip()
+        if Config._is_usable_local_ipv4(ip):
+            log.info(f"自动检测局域网 IP fallback: {ip}")
+            return ip
+        return "127.0.0.1"
+
+    @staticmethod
+    def _collect_local_ipv4_candidates() -> list[tuple[str, str]]:
+        """枚举本机 IPv4 候选地址，返回 (ip, 来源/接口名)。"""
+        candidates: list[tuple[str, str]] = []
+
+        # Linux/OpenWrt: 最可靠，可拿到接口名用于降低 Docker/VPN 等虚拟网卡优先级。
+        candidates.extend(Config._collect_from_ip_addr())
+
+        # Windows/macOS fallback: 解析系统网络配置输出。
+        candidates.extend(Config._collect_from_ipconfig())
+        candidates.extend(Config._collect_from_ifconfig())
+
+        # 标准库 fallback: 不依赖外部命令，但通常拿不到接口名。
+        for host in {socket.gethostname(), socket.getfqdn()}:
+            if not host:
+                continue
+            try:
+                infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+            except OSError:
+                continue
+            for info in infos:
+                candidates.append((info[4][0], f"hostname:{host}"))
+
+        # 最后保留旧逻辑作为 fallback 候选，不能作为唯一的首选依据。
+        candidates.append((Config._detect_default_route_ip(), "default-route"))
+        return candidates
+
+    @staticmethod
+    def _collect_from_ip_addr() -> list[tuple[str, str]]:
+        try:
+            proc = subprocess.run(
+                ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        result = []
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                result.append((parts[3].split("/", 1)[0], parts[1]))
+        return result
+
+    @staticmethod
+    def _collect_from_ipconfig() -> list[tuple[str, str]]:
+        try:
+            proc = subprocess.run(
+                ["ipconfig"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        result = []
+        adapter = "ipconfig"
+        for raw_line in proc.stdout.splitlines():
+            line = raw_line.strip()
+            if line.endswith(":") and not re.search(r"\d+\.\d+\.\d+\.\d+", line):
+                adapter = line[:-1]
+            if "ipv4" not in line.lower():
+                continue
+            match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+            if match:
+                result.append((match.group(1), adapter))
+        return result
+
+    @staticmethod
+    def _collect_from_ifconfig() -> list[tuple[str, str]]:
+        try:
+            proc = subprocess.run(
+                ["ifconfig"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        result = []
+        iface = "ifconfig"
+        for raw_line in proc.stdout.splitlines():
+            if raw_line and not raw_line[0].isspace():
+                iface = raw_line.split(":", 1)[0].strip()
+            match = re.search(r"\binet\s+(\d{1,3}(?:\.\d{1,3}){3})", raw_line)
+            if match:
+                result.append((match.group(1), iface))
+        return result
+
+    @staticmethod
+    def _detect_default_route_ip() -> str:
+        s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
+            return s.getsockname()[0]
+        except OSError:
             return "127.0.0.1"
+        finally:
+            if s:
+                s.close()
+
+    @staticmethod
+    def _is_usable_local_ipv4(ip: str) -> bool:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return not (
+            addr.is_loopback
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr.is_unspecified
+            or addr.is_reserved
+        )
+
+    @staticmethod
+    def _score_local_ipv4(ip: str, source: str = "") -> int:
+        addr = ipaddress.ip_address(ip)
+        source_lower = source.lower()
+        score = 0
+        if addr.is_private:
+            score += 100
+        if ip.startswith("192.168."):
+            score += 50
+        elif ip.startswith("10."):
+            score += 40
+        elif ipaddress.ip_address("172.16.0.0") <= addr <= ipaddress.ip_address("172.31.255.255"):
+            score += 30
+
+        virtual_markers = (
+            "docker", "veth", "br-", "vmware", "virtualbox", "vbox", "hyper-v",
+            "wsl", "tailscale", "zerotier", "vpn", "tun", "tap", "wg", "ppp",
+            "utun", "awdl", "llw", "anpi",
+        )
+        if any(marker in source_lower for marker in virtual_markers):
+            score -= 120
+        if ip.startswith("172.17.") or ip.startswith("172.18."):
+            score -= 30
+        if source_lower == "default-route":
+            score -= 20
+        return score
 
     @property
     def mi_token_home(self) -> str:

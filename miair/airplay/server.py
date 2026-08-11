@@ -9,7 +9,6 @@ import base64
 from collections import deque
 from dataclasses import dataclass
 import logging
-import os
 import queue
 import socket
 import struct
@@ -26,6 +25,7 @@ from Crypto.Cipher import AES
 from miair.airplay.audio_stream import AudioStreamServer
 from miair.airplay.mdns import AirPlayMDNS
 from miair.airplay.playfair import PlayFair
+from miair.config import Config
 
 log = logging.getLogger("miair")
 
@@ -409,19 +409,14 @@ class AirPlayServer:
         return int(self.device_id.replace(":", ""), base=16).to_bytes(6, "big")
 
     def _get_ipv4(self) -> str:
-        """获取本机 IPv4 地址"""
-        hostname = os.getenv("MIAIR_HOSTNAME", "")
-        if hostname and hostname != "127.0.0.1":
-            return hostname
-        
+        """获取 AirPlay 认证使用的 IPv4，保持与服务发布地址一致。"""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
+            socket.inet_pton(socket.AF_INET, self.hostname)
+            if self.hostname not in ("0.0.0.0", "127.0.0.1"):
+                return self.hostname
+        except OSError:
+            pass
+        return Config._detect_local_ip()
 
     @property
     def ipv4_bin(self) -> bytes:
