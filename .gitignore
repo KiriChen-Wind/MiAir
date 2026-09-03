@@ -4,3 +4,4 @@
 __pycache__/
 *.py[codz]
 *$py.class
+*.egg-info/

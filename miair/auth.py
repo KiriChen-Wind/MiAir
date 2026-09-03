@@ -1,8 +1,13 @@
 """小米账号认证管理"""
 
+import asyncio
+import base64
+import hashlib
+import json
 import logging
 import os
 import re
+from urllib import parse
 
 import aiohttp
 from miservice import MiAccount, MiIOService, MiNAService
@@ -10,6 +15,8 @@ from miservice import MiAccount, MiIOService, MiNAService
 from miair.config import Config
 
 log = logging.getLogger("miair")
+
+APP_UA = "APP/com.xiaomi.mihome APPV/60209 iosPassportSDK/3.9.0 iOS/17.5.1"
 
 
 def parse_cookie_string(cookie_str: str) -> dict:
@@ -53,25 +60,83 @@ class AuthManager:
         token_data = {}
         if self.config.cookie:
             token_data = parse_cookie_string(self.config.cookie)
-        
+
+        uid = token_data.get("userId")
+        ptk = token_data.get("passToken")
+
         # 创建 MiAccount，如果使用 cookie 登录，传入空的账号密码
-        if token_data.get("userId") and token_data.get("passToken"):
-            # 使用 cookie 登录，传入空的账号密码，避免触发密码登录流程
+        if uid and ptk:
             self.account = MiAccount(
                 self.session,
                 "",  # 空账号
                 "",  # 空密码
                 token_store=token_store,
             )
-            # 设置 token，包含所有必要字段
-            self.account.token = {
-                "userId": token_data["userId"],
-                "passToken": token_data["passToken"],
-                "deviceId": "miair_device",
-                "ssecurity": "",
-                "serviceToken": "",
-            }
-            log.info("使用 cookie 登录")
+            self.account.now_ua = APP_UA
+
+            # 1. 优先检查本地缓存是否已有针对该 uid/ptk 的有效 serviceToken
+            cached = self.account.token_store.load_token() if self.account.token_store else None
+            if (
+                cached
+                and str(cached.get("userId")) == str(uid)
+                and cached.get("passToken") == ptk
+                and "micoapi" in cached
+            ):
+                self.account.token = cached
+                self._logged_in = True
+                log.info("使用本地缓存的 micoapi serviceToken 登录成功")
+            else:
+                # 2. 使用 passToken 通过米家 SDK 接口换取真正的长期有效 serviceToken
+                dev_id = hashlib.md5(f"miair_{uid}".encode()).hexdigest()[:16].upper()
+                headers = {"User-Agent": APP_UA}
+                cookies = {
+                    "sdkVersion": "3.9",
+                    "deviceId": dev_id,
+                    "userId": str(uid),
+                    "passToken": str(ptk),
+                }
+                url = "https://account.xiaomi.com/pass/serviceLogin?sid=micoapi&_json=true"
+                try:
+                    async with self.session.get(url, cookies=cookies, headers=headers) as r:
+                        raw = await r.read()
+                        text = raw.decode("utf-8", errors="ignore")
+                        if text.startswith("&&&START&&&"):
+                            text = text[11:]
+                        resp = json.loads(text)
+
+                    if resp.get("code") == 0:
+                        location = resp["location"]
+                        nonce = resp["nonce"]
+                        ssecurity = resp["ssecurity"]
+                        nsec = f"nonce={nonce}&{ssecurity}"
+                        client_sign = base64.b64encode(hashlib.sha1(nsec.encode()).digest()).decode()
+                        async with self.session.get(location + "&clientSign=" + parse.quote(client_sign)) as r2:
+                            service_token_cookie = r2.cookies.get("serviceToken")
+                            if service_token_cookie:
+                                service_token = service_token_cookie.value
+                            else:
+                                raise Exception("未在鉴权响应中提取到 serviceToken")
+
+                        self.account.token = {
+                            "userId": str(uid),
+                            "passToken": str(ptk),
+                            "deviceId": dev_id,
+                            "ssecurity": ssecurity,
+                            "serviceToken": service_token,
+                            "micoapi": (ssecurity, service_token),
+                        }
+                        if self.account.token_store:
+                            self.account.token_store.save_token(self.account.token)
+                        self._logged_in = True
+                        log.info("使用 passToken 成功换取 micoapi serviceToken 并持久化缓存")
+                    else:
+                        self._logged_in = False
+                        code = resp.get("code")
+                        desc = resp.get("description") or resp.get("desc", "")
+                        log.error(f"passToken 换取小米 serviceToken 失败 (code {code}): {desc}")
+                except Exception as e:
+                    self._logged_in = False
+                    log.error(f"通过 Cookie/passToken 换取小米凭据异常: {e}")
         else:
             # 使用账号密码登录
             self.account = MiAccount(
@@ -80,25 +145,18 @@ class AuthManager:
                 self.config.password,
                 token_store=token_store,
             )
-            # 确保 token 不为 None，避免后续操作出错
+            self.account.now_ua = APP_UA
             if not hasattr(self.account, 'token') or self.account.token is None:
-                self.account.token = {"deviceId": "miair_device"}
+                self.account.token = {"deviceId": hashlib.md5(b"miair").hexdigest()[:16].upper()}
 
-        # 显式调用 login
-        # 如果使用 cookie 登录，跳过 login 调用，直接标记为已登录
-        if token_data.get("userId") and token_data.get("passToken"):
-            self._logged_in = True
-            log.info("使用 cookie 登录成功")
-        else:
             try:
                 await self.account.login("micoapi")
                 self._logged_in = True
                 log.info("小米账号登录成功")
             except Exception as e:
                 self._logged_in = False
-                # 确保 token 不为 None，避免后续操作出错
                 if not hasattr(self.account, 'token') or self.account.token is None:
-                    self.account.token = {"deviceId": "miair_device"}
+                    self.account.token = {"deviceId": hashlib.md5(b"miair").hexdigest()[:16].upper()}
                 err_msg = str(e)
                 err_code = self._extract_error_code(err_msg)
                 if err_code == "87001" or "captcha" in err_msg.lower():
@@ -122,20 +180,17 @@ class AuthManager:
                     )
                 else:
                     log.error(f"登录失败: {e}")
-                
-                # 如果开启了自动重启，则在严重错误时尝试重启程序
+
                 if self.config.auto_restart:
                     log.warning("检测到登录失败，正在尝试自动重启程序以恢复服务...")
                     from miair.web.api import _restart_process
-                    import asyncio
                     try:
                         loop = asyncio.get_running_loop()
                         loop.call_later(5, _restart_process)
                     except RuntimeError:
-                        # 如果没有正在运行的 loop，则直接重启
                         _restart_process()
 
-        # 无论是否登录成功，都设置 service (方便后续重试)
+        # 无论是否登录成功，都设置 service
         self.mina_service = MiNAService(self.account)
         self.miio_service = MiIOService(self.account)
 
@@ -157,14 +212,14 @@ class AuthManager:
             log.warning("未成功登录，无法获取设备列表")
             return []
         try:
+            if self.account:
+                self.account.now_ua = APP_UA
             devices = await self.mina_service.device_list()
             return devices or []
         except Exception as e:
             log.warning(f"获取设备列表失败: {e}")
-            # 可能 token 过期，尝试重新登录
-            # 但如果使用 cookie 登录，不要重新调用 login（避免 KeyError）
             if self.config.cookie:
-                log.error(f"Cookie 可能已过期，请重新获取: {e}")
+                log.error(f"Cookie 可能已过期或失效: {e}")
                 return []
             await self.close()
             await self.login()
