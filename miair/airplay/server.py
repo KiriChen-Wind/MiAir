@@ -142,6 +142,10 @@ class PlaybackPacer:
         self._startup_count: int = 0
         self._startup_target: int = 32  # ~256ms
         self._started: bool = False
+        # 迟到纠正: 重锚点限速、重锚次数、上次 D4 锚点更新时间
+        self._last_reanchor_perf: float = 0.0
+        self._reanchor_count: int = 0
+        self._last_anchor_update_perf: float = 0.0
 
     @property
     def has_anchor(self) -> bool:
@@ -158,6 +162,7 @@ class PlaybackPacer:
         """
         now_perf = time.perf_counter()
         with self._lock:
+            self._last_anchor_update_perf = now_perf
             if self._anchor_rtp_ts is None:
                 # 首次同步: 建立锚点
                 self._anchor_rtp_ts = play_at_rtp_ts
@@ -176,9 +181,28 @@ class PlaybackPacer:
                     self._anchor_rtp_ts = play_at_rtp_ts
                     self._anchor_perf = now_perf + self._target_latency_sec
 
+    # 两次重锚之间的最小间隔，避免抖动时反复重锚
+    _REANCHOR_MIN_INTERVAL: float = 0.5
+
+    def _reanchor(self, rtp_timestamp: int, now: float) -> bool:
+        """把锚点重设到当前帧。调用方须已持有 self._lock。返回是否真的重锚了。"""
+        if now - self._last_reanchor_perf < self._REANCHOR_MIN_INTERVAL:
+            return False
+        self._anchor_rtp_ts = rtp_timestamp
+        self._anchor_perf = now + self._target_latency_sec
+        self._last_reanchor_perf = now
+        self._reanchor_count += 1
+        return True
+
     def wait_for_frame(self, rtp_timestamp: int) -> bool:
         """解码线程调用。等到帧应该释放的时刻。
+
         返回 True = 播放，False = 太晚了跳过。
+
+        帧迟到超过 100ms 时**不再丢帧**：丢帧会让音箱少播约 8ms 音频，听感上就是
+        一次断音。改为重设锚点后照常播出 —— 时序同样被校正（延迟不会累积），
+        但不损失任何音频。实测（小爱音箱 Pro / Windows）迟到量稳定在 100~110ms
+        （刚好越过阈值一点点），原实现在这种情况下每几秒就丢一帧。
         """
         if rtp_timestamp == 0:
             return True  # 静音帧直接播放
@@ -201,10 +225,25 @@ class PlaybackPacer:
         if wait_time > 0.005:  # 超过 5ms 才 sleep
             time.sleep(wait_time)
             return True
-        elif wait_time < -0.100:  # 超过 100ms 过期
-            return False  # 跳过
-        else:
-            return True  # 稍微迟到但可接受
+
+        if wait_time < -0.100:  # 超过 100ms 过期
+            with self._lock:
+                reanchored = self._reanchor(rtp_timestamp, now)
+                count = self._reanchor_count
+                since_anchor = (
+                    now - self._last_anchor_update_perf
+                    if self._last_anchor_update_perf > 0
+                    else -1.0
+                )
+            if reanchored and (count <= 10 or count % 50 == 0):
+                # 原实现在此分支完全静默，出问题时无从察觉
+                log.info(
+                    f"Pacer: 帧迟到 {abs(wait_time) * 1000:.0f}ms，已重设锚点而非丢帧"
+                    f"（距上次 D4 同步 {since_anchor * 1000:.0f}ms，累计 {count} 次）"
+                )
+            return True
+
+        return True  # 稍微迟到但可接受
 
     def reset(self) -> None:
         """FLUSH 时重置。"""
@@ -214,6 +253,8 @@ class PlaybackPacer:
             self._drift_rate = 1.0
             self._startup_count = 0
             self._started = False
+            # FLUSH 后允许立刻重锚（_reanchor_count 保留，用于统计）
+            self._last_reanchor_perf = 0.0
 
 
 class NTPClockSync:
