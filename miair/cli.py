@@ -39,6 +39,10 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # 音频是软实时任务：缩短 GIL 切换间隔，避免某个线程长时间独占解释器
+    # 导致解码/写流线程被推迟（默认 5ms 在这里偏大）。
+    sys.setswitchinterval(0.002)
+
     # 加载配置
     config = Config.load(args.conf_path)
 

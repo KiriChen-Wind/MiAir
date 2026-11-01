@@ -1,14 +1,17 @@
 """AirPlay 音频 HTTP 流输出
 
-将解码后的 PCM 音频数据转换为 HTTP 音频流，供小爱音箱播放。
-支持两种输出格式:
-- MP3: 兼容性好，适用于 L05B/L05C/LX06/L16A 等不支持 WAV 的音箱
-- WAV: 零编码延迟，直接输出 PCM，适用于大多数音箱
+把解码后的 PCM 音频通过 HTTP 提供给小爱音箱播放：
+- WAV：直接输出 PCM，零编码延迟（大多数音箱）
+- MP3：ffmpeg 实时转码（不支持 WAV 的音箱）
+
+音箱是「自己按实时速率拉流」的客户端，因此这里只做一件事：稳定供货。
 """
 
 import asyncio
 import logging
+import os
 import queue
+import socket
 import struct
 import subprocess
 import threading
@@ -18,18 +21,19 @@ from aiohttp import web
 
 log = logging.getLogger("miair")
 
-# --- 队列参数 ---
-# 每个 ALAC 包约 8ms (352 samples @ 44100Hz)
-# 100 个包 ≈ 800ms 的缓冲上限，兼顾低延迟与抗 WiFi 抖动
-_QUEUE_MAXSIZE = 100
+# 单个 ALAC 帧 = 352 采样 ≈ 8ms @ 44.1kHz
+_FRAME_SECONDS = 352 / 44100
+
+_MAX_QUEUE_FRAMES = 192             # 缓冲硬上限 ≈ 1.5s，只有音箱卡住时才会触及
+_BATCH_WINDOW = 0.016               # 攒包窗口：把 16ms 内的数据合并成一次写出
+_BATCH_BYTES = 8192
+_BATCH_FRAMES = 32
+_KEEPALIVE_GAP = 1.0                # 断流超过 1s 就补 20ms 静音，避免音箱判定流结束
+_KEEPALIVE_BPS_DIVISOR = 50         # 20ms 的 PCM 字节数 = bytes_per_second / 50
 
 
 class AudioStreamServer:
-    """HTTP 音频流服务器
-
-    接收 PCM 音频数据，通过 HTTP 提供给小爱音箱播放。
-    根据音箱型号选择 MP3 (ffmpeg 转码) 或 WAV (直接输出) 格式。
-    """
+    """把解码后的 PCM 通过 HTTP 流推给音箱"""
 
     def __init__(self, hostname: str, port: int = 0, audio_format: str = "wav"):
         self.hostname = hostname
@@ -39,20 +43,27 @@ class AudioStreamServer:
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
 
-        # 音频数据队列 - 小队列 = 低延迟
-        self._audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=_QUEUE_MAXSIZE)
+        self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=_MAX_QUEUE_FRAMES)
         self._sample_rate = 44100
         self._channels = 2
         self._sample_width = 2  # 16-bit
-        self._active = False
-        self._abort = False
+
+        self._active = False       # 当前是否有 AirPlay 播放会话
+        self._abort = False        # 通知当前的 HTTP 拉流线程退出
         self._session_id = int(time.time())
-        self._has_clients = False
-        self._client_lock = threading.Lock()
+
+        # 运行期统计：入/出字节一对比就能看出有没有丢音（卡顿时先看这一行）
+        # 注意 WAV 模式下两侧都是 PCM；MP3 模式下 出 是转码后的 MP3 字节，不可直接比较
+        self._stats = {
+            "in_bytes": 0,      # 写入队列的字节
+            "out_bytes": 0,     # 已发给音箱的字节
+            "dropped": 0,       # 队列溢出丢弃的帧数
+            "keepalive": 0,     # 为保活补写的静音字节
+        }
 
         self._setup_routes()
 
-    def _setup_routes(self):
+    def _setup_routes(self) -> None:
         if self._audio_format == "mp3":
             self._app.router.add_get("/airplay/stream.mp3", self._handle_stream_mp3)
         else:
@@ -63,7 +74,25 @@ class AudioStreamServer:
         ext = "mp3" if self._audio_format == "mp3" else "wav"
         return f"http://{self.hostname}:{self.port}/airplay/stream.{ext}?sid={self._session_id}"
 
-    async def start(self):
+    @property
+    def bytes_per_second(self) -> int:
+        return self._sample_rate * self._channels * self._sample_width
+
+    def buffered_seconds(self) -> float:
+        """队列里待发送的音频时长（按 8ms/帧估算，用于观测）"""
+        return self._audio_queue.qsize() * _FRAME_SECONDS
+
+    def stats_line(self) -> str:
+        s = self._stats
+        return (
+            f"缓冲={self.buffered_seconds():.2f}s "
+            f"入={s['in_bytes'] / 1048576:.1f}MB "
+            f"出={s['out_bytes'] / 1048576:.1f}MB "
+            f"丢帧={s['dropped']} "
+            f"补静音={s['keepalive'] / 1024:.0f}KB"
+        )
+
+    async def start(self) -> None:
         self._runner = web.AppRunner(self._app, access_log=None)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, "0.0.0.0", self.port)
@@ -71,70 +100,74 @@ class AudioStreamServer:
         self.port = self._site._server.sockets[0].getsockname()[1]
         log.info(f"AirPlay 音频流服务器: http://{self.hostname}:{self.port} (格式: {self._audio_format})")
 
-    async def stop(self):
+    async def stop(self) -> None:
         self._active = False
-        try:
-            self._audio_queue.put_nowait(None)
-        except queue.Full:
-            pass
+        self._abort = True
         if self._runner:
             await self._runner.cleanup()
 
-    def set_audio_params(self, sample_rate: int, channels: int, sample_width: int = 2):
+    def set_audio_params(self, sample_rate: int, channels: int, sample_width: int = 2) -> None:
         self._sample_rate = sample_rate
         self._channels = channels
         self._sample_width = sample_width
 
-    def start_streaming(self):
+    def start_streaming(self) -> None:
+        """新的播放会话开始：清空残留数据并重置统计"""
+        self._clear_queue()
         self._active = True
         self._abort = False
         self._session_id = int(time.time())
-        # 快速清空队列
-        while True:
-            try:
-                self._audio_queue.get_nowait()
-            except queue.Empty:
-                break
+        self._stats = dict.fromkeys(self._stats, 0)
         log.info(f"音频流: 开始接收 PCM 数据 (格式: {self._audio_format})")
 
-    def stop_streaming(self):
+    def stop_streaming(self) -> None:
         self._active = False
         self._abort = True
+        self._clear_queue()
+        log.info(f"音频流: 停止接收 PCM 数据 ({self.stats_line()})")
+
+    def _clear_queue(self) -> None:
         while True:
             try:
                 self._audio_queue.get_nowait()
             except queue.Empty:
-                break
-        try:
-            self._audio_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        log.info("音频流: 停止接收 PCM 数据")
+                return
 
-    def write_pcm(self, data: bytes):
-        """写入 PCM 音频数据 — 非阻塞，队列满时批量丢弃旧数据腾出空间"""
+    def write_pcm(self, data: bytes) -> None:
+        """写入解码后的 PCM（非阻塞）。
+
+        队列满意味着音箱没跟上（卡住/被打断）：丢最旧的一帧保低延迟，
+        而不是整块丢弃 —— 整块丢弃会造成可听见的跳音。
+        """
         if not self._active:
             return
-        try:
-            self._audio_queue.put_nowait(data)
-        except queue.Full:
-            # 批量丢弃旧数据，一次性腾出足够空间，避免反复 put/get 开销
-            dropped = 0
-            target = _QUEUE_MAXSIZE // 4  # 丢弃 25% 腾出充裕空间
-            try:
-                for _ in range(target):
-                    self._audio_queue.get_nowait()
-                    dropped += 1
-            except queue.Empty:
-                pass
+        self._stats["in_bytes"] += len(data)
+        while True:
             try:
                 self._audio_queue.put_nowait(data)
+                return
             except queue.Full:
-                pass
+                try:
+                    self._audio_queue.get_nowait()
+                    self._stats["dropped"] += 1
+                except queue.Empty:
+                    continue
 
-    # ============================================================
-    # WAV 模式 — 直接输出 PCM，零编码延迟
-    # ============================================================
+    def _collect(self, first: bytes) -> bytes:
+        """把紧随其后已就绪的 PCM 合并成一批，减少小包写出的开销"""
+        parts = [first]
+        total = len(first)
+        deadline = time.perf_counter() + _BATCH_WINDOW
+        while total < _BATCH_BYTES and len(parts) < _BATCH_FRAMES:
+            if time.perf_counter() >= deadline:
+                break
+            try:
+                extra = self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
+            parts.append(extra)
+            total += len(extra)
+        return b"".join(parts)
 
     def _reject_if_inactive(self) -> web.Response | None:
         """流已停止（TEARDOWN 后）返回 404 拒绝拉取，避免音箱把空响应当成 EOF
@@ -148,131 +181,112 @@ class AudioStreamServer:
     def _build_wav_header(self, data_size: int = 0x7FFFFF00) -> bytes:
         byte_rate = self._sample_rate * self._channels * self._sample_width
         block_align = self._channels * self._sample_width
-        bits_per_sample = self._sample_width * 8
         return struct.pack(
             '<4sI4s4sIHHIIHH4sI',
             b'RIFF', data_size + 36, b'WAVE',
             b'fmt ', 16, 1, self._channels,
-            self._sample_rate, byte_rate, block_align, bits_per_sample,
+            self._sample_rate, byte_rate, block_align, self._sample_width * 8,
             b'data', data_size,
         )
 
-    async def _handle_stream_wav(self, request: web.Request) -> web.StreamResponse:
-        """WAV 模式: 直接输出 PCM 数据，零编码延迟
-
-        使用专用写入线程从队列批量读取数据，通过 asyncio 事件写回 HTTP 响应，
-        避免每个包都经过 asyncio.to_thread 的调度开销。
-        """
-        rejected = self._reject_if_inactive()
-        if rejected is not None:
-            return rejected
-
+    @staticmethod
+    def _prepare_stream_response(request: web.Request, content_type: str) -> web.StreamResponse:
+        """构建流式响应，并关闭 Nagle 让小包立刻发出"""
         response = web.StreamResponse(
             status=200,
             headers={
-                "Content-Type": "audio/wav",
+                "Content-Type": content_type,
                 "Cache-Control": "no-cache, no-store",
                 "Pragma": "no-cache",
                 "Connection": "close",
                 "Transfer-Encoding": "chunked",
             },
         )
-        await response.prepare(request)
-
-        # 关闭 Nagle 算法，让小包立即发送而不等待合并
         transport = request.transport
         if transport is not None:
-            sock = transport.get_extra_info('socket')
+            sock = transport.get_extra_info("socket")
             if sock is not None:
-                import socket as _sock
-                sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return response
 
-        with self._client_lock:
-            self._has_clients = True
-        self._abort = False  # 重置中断标志，允许续播
+    # ============================================================
+    # WAV 模式 — 直接输出 PCM，零编码延迟
+    # ============================================================
 
+    async def _handle_stream_wav(self, request: web.Request) -> web.StreamResponse:
+        rejected = self._reject_if_inactive()
+        if rejected is not None:
+            return rejected
+
+        response = self._prepare_stream_response(request, "audio/wav")
+        await response.prepare(request)
+
+        self._abort = False          # 允许续播（音箱重连时重新开始拉流）
         log.info("AirPlay: 音箱开始拉取 WAV 音频流 (零编码延迟)")
 
-        # 使用 asyncio.Event 在写入线程和事件循环间通信
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         data_ready = asyncio.Event()
-        pending_data: list[bytes] = []
-        data_lock = threading.Lock()
-        writer_done = False
+        pending: list[bytes] = []
+        pending_lock = threading.Lock()
+        reader_done = False
 
-        def _reader_thread():
-            """专用线程：从队列批量读取 PCM 并通知事件循环"""
-            nonlocal writer_done
-            empty_streak = 0
+        def _reader() -> None:
+            """从队列取 PCM 并通知事件循环写出（攒包 + 长时间空转时补静音保活）"""
+            nonlocal reader_done
+            idle_since: float | None = None
+            keepalive_bytes = self.bytes_per_second // _KEEPALIVE_BPS_DIVISOR
             try:
                 while self._active and not self._abort:
                     try:
                         chunk = self._audio_queue.get(timeout=0.02)
-                        if chunk is None:
-                            break
-                        # 本地批量收集，避免每个 chunk 都加锁
-                        local_batch = [chunk]
-                        for _ in range(31):
-                            try:
-                                extra = self._audio_queue.get_nowait()
-                                if extra is None:
-                                    break
-                                local_batch.append(extra)
-                            except queue.Empty:
-                                break
-                        with data_lock:
-                            pending_data.extend(local_batch)
-                        loop.call_soon_threadsafe(data_ready.set)
-                        empty_streak = 0
                     except queue.Empty:
-                        empty_streak += 1
-                        # 3 秒无数据写入静音保持连接
-                        if empty_streak > 100:
-                            silence = b'\x00' * (self._sample_rate * self._channels * self._sample_width // 50)
-                            with data_lock:
-                                pending_data.append(silence)
+                        if idle_since is None:
+                            idle_since = time.perf_counter()
+                        elif time.perf_counter() - idle_since >= _KEEPALIVE_GAP:
+                            with pending_lock:
+                                pending.append(b"\x00" * keepalive_bytes)
+                            self._stats["keepalive"] += keepalive_bytes
                             loop.call_soon_threadsafe(data_ready.set)
+                            idle_since = time.perf_counter()
                         continue
+
+                    idle_since = None
+                    with pending_lock:
+                        pending.append(self._collect(chunk))
+                    loop.call_soon_threadsafe(data_ready.set)
             except Exception as e:
                 log.error(f"WAV reader 异常: {e}")
             finally:
-                writer_done = True
+                reader_done = True
                 loop.call_soon_threadsafe(data_ready.set)
 
-        reader = threading.Thread(target=_reader_thread, daemon=True)
-        reader.start()
+        threading.Thread(target=_reader, daemon=True).start()
 
         try:
-            # 发送 WAV 头
             await response.write(self._build_wav_header())
-
-            while not writer_done:
+            while not reader_done:
                 await data_ready.wait()
                 data_ready.clear()
-                with data_lock:
-                    chunks = pending_data
-                    pending_data = []
+                with pending_lock:
+                    chunks, pending = pending, []
                 if chunks:
-                    # 批量写入：合并所有 chunk 一次性写出
-                    await response.write(b"".join(chunks))
+                    blob = b"".join(chunks)
+                    await response.write(blob)
+                    self._stats["out_bytes"] += len(blob)
         except (ConnectionResetError, BrokenPipeError):
             log.info("AirPlay: 音箱断开 WAV 音频流连接")
-        except Exception as e:
-            pass
         finally:
-            self._abort = True  # 通知 reader 线程退出
-            with self._client_lock:
-                self._has_clients = False
+            self._abort = True
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
 
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
         log.info("AirPlay: WAV 音频流结束")
         return response
 
     # ============================================================
-    # MP3 模式 — ffmpeg 实时转码 (用于不支持 WAV 的音箱)
+    # MP3 模式 — ffmpeg 实时转码（用于不支持 WAV 的音箱）
     # ============================================================
 
     async def _handle_stream_mp3(self, request: web.Request) -> web.StreamResponse:
@@ -280,120 +294,68 @@ class AudioStreamServer:
         if rejected is not None:
             return rejected
 
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "audio/mpeg",
-                "Cache-Control": "no-cache, no-store",
-                "Pragma": "no-cache",
-                "Connection": "close",
-            },
-        )
+        response = self._prepare_stream_response(request, "audio/mpeg")
         await response.prepare(request)
 
-        # 关闭 Nagle 算法
-        transport = request.transport
-        if transport is not None:
-            sock = transport.get_extra_info('socket')
-            if sock is not None:
-                import socket as _sock
-                sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1)
-
-        with self._client_lock:
-            self._has_clients = True
-        self._abort = False  # 重置中断标志，允许续播
-
+        self._abort = False
         log.info("AirPlay: 音箱开始拉取 MP3 音频流")
 
-        import os
         ffmpeg_bin = "ffmpeg"
-        if os.path.exists("ffmpeg.exe"):
-            ffmpeg_bin = os.path.abspath("ffmpeg.exe")
-        elif os.path.exists("bin/ffmpeg.exe"):
-            ffmpeg_bin = os.path.abspath("bin/ffmpeg.exe")
-
-        ffmpeg_cmd = [
-            ffmpeg_bin,
-            "-loglevel", "error",
-            "-fflags", "+nobuffer+flush_packets",
-            "-flags", "low_delay",
-            "-f", "s16le",
-            "-ar", str(self._sample_rate),
-            "-ac", str(self._channels),
-            "-i", "pipe:0",
-            "-acodec", "libmp3lame",
-            "-compression_level", "0",  # 最快编码速度
-            "-ab", "128k",
-            "-ac", "2",
-            "-ar", "44100",
-            "-flush_packets", "1",
-            "-id3v2_version", "0",
-            "-f", "mp3",
-            "pipe:1"
-        ]
+        for candidate in ("ffmpeg.exe", "bin/ffmpeg.exe"):
+            if os.path.exists(candidate):
+                ffmpeg_bin = os.path.abspath(candidate)
+                break
 
         try:
             proc = subprocess.Popen(
-                ffmpeg_cmd,
+                [
+                    ffmpeg_bin,
+                    "-loglevel", "error",
+                    "-fflags", "+nobuffer+flush_packets",
+                    "-flags", "low_delay",
+                    "-f", "s16le",
+                    "-ar", str(self._sample_rate),
+                    "-ac", str(self._channels),
+                    "-i", "pipe:0",
+                    "-acodec", "libmp3lame",
+                    "-compression_level", "0",   # 最快编码速度
+                    "-ab", "128k",
+                    "-ac", "2",
+                    "-ar", "44100",
+                    "-flush_packets", "1",
+                    "-id3v2_version", "0",
+                    "-f", "mp3",
+                    "pipe:1",
+                ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 bufsize=0,
             )
         except FileNotFoundError:
             log.error("ffmpeg 未找到，无法转码音频流")
-            with self._client_lock:
-                self._has_clients = False
             await response.write_eof()
             return response
 
-        def drain_stderr():
+        def _feed() -> None:
+            """把 PCM 喂给 ffmpeg（攒包写管道，减少系统调用）"""
+            idle_since: float | None = None
+            keepalive_bytes = self.bytes_per_second // _KEEPALIVE_BPS_DIVISOR
             try:
-                while True:
-                    line = proc.stderr.readline()
-                    if not line:
-                        break
-                    line_str = line.decode('utf-8', errors='ignore').strip()
-                    if line_str and 'rror' in line_str:
-                        pass
-            except Exception:
-                pass
-
-        threading.Thread(target=drain_stderr, daemon=True).start()
-
-        def feed_ffmpeg():
-            empty_streak = 0
-            try:
-                while True:
+                while self._active and not self._abort:
                     try:
                         chunk = self._audio_queue.get(timeout=0.05)
-                        if chunk is None:
-                            break
-                        # 批量收集数据后一次性写入，减少 write 系统调用次数
-                        chunks = [chunk]
-                        for _ in range(15):
-                            try:
-                                extra = self._audio_queue.get_nowait()
-                                if extra is None:
-                                    proc.stdin.close()
-                                    return
-                                chunks.append(extra)
-                            except queue.Empty:
-                                break
-                        proc.stdin.write(b"".join(chunks))
-                        empty_streak = 0
                     except queue.Empty:
-                        empty_streak += 1
-                        if empty_streak > 40:
-                            silence = b'\x00' * (self._sample_rate * self._channels * self._sample_width // 50)
-                            try:
-                                proc.stdin.write(silence)
-                            except Exception:
-                                break
+                        if idle_since is None:
+                            idle_since = time.perf_counter()
+                        elif time.perf_counter() - idle_since >= _KEEPALIVE_GAP:
+                            proc.stdin.write(b"\x00" * keepalive_bytes)
+                            self._stats["keepalive"] += keepalive_bytes
+                            idle_since = time.perf_counter()
                         continue
-                    except (BrokenPipeError, OSError):
-                        break
-            except Exception as e:
+                    idle_since = None
+                    proc.stdin.write(self._collect(chunk))
+            except (BrokenPipeError, OSError, ValueError):
                 pass
             finally:
                 try:
@@ -401,36 +363,28 @@ class AudioStreamServer:
                 except Exception:
                     pass
 
-        threading.Thread(target=feed_ffmpeg, daemon=True).start()
+        threading.Thread(target=_feed, daemon=True).start()
 
-        # 从 ffmpeg stdout 读取并写给客户端
         try:
             while self._active and not self._abort:
                 audio_data = await asyncio.to_thread(proc.stdout.read, 8192)
-                if not audio_data or self._abort:
+                if not audio_data:
                     break
                 await response.write(audio_data)
+                self._stats["out_bytes"] += len(audio_data)
         except (ConnectionResetError, BrokenPipeError):
             log.info("AirPlay: 音箱断开 MP3 音频流连接")
-        except Exception as e:
-            pass
         finally:
+            self._abort = True
             try:
                 proc.terminate()
                 proc.wait(timeout=2)
             except Exception:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=2)
-                except Exception:
-                    pass
+                proc.kill()
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
 
-        with self._client_lock:
-            self._has_clients = False
-
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
         log.info("AirPlay: MP3 音频流结束")
         return response

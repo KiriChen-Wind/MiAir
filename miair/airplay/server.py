@@ -12,11 +12,8 @@ import logging
 import queue
 import socket
 import struct
-import subprocess
-import sys
 import threading
 import time
-import uuid
 from typing import Callable
 
 import av
@@ -34,74 +31,60 @@ log = logging.getLogger("miair")
 # 核心数据结构
 # ============================================================
 
-@dataclass
-class PacketData:
-    """解码队列中的音频包"""
-    seq: int          # 序列号；-1 = 静音帧
-    timestamp: int    # RTP 时间戳 (32-bit)；0 = 无时间戳
-    payload: bytes    # 加密音频数据或静音帧
+NTP_EPOCH_OFFSET = 2208988800.0  # 1900-01-01 → 1970-01-01 的秒数
+
+# --- RTP 接收参数 ---
+_RTP_HEADER_LEN = 12
+_PREBUFFER_PACKETS = 32          # 开始输出前先攒 ~256ms，跨过开头的网络抖动
+_GAP_DETECT_MIN = 8              # jitter buffer 里至少这么多包才做缺口检测
+_RETRANSMIT_INTERVAL = 0.030     # 重传请求起始间隔（之后翻倍）
+_RETRANSMIT_MAX_INTERVAL = 0.080
+_RETRANSMIT_GIVE_UP = 0.150      # 超过该时长仍未补到 → 补静音跳过（AirPlay 重传通常 <50ms）
+_MAX_GAP_FILL = 32               # 一次最多补多少帧静音
+_DECODE_QUEUE_MAX = 200          # 解码队列 ≈ 1.6s
+_STATS_EVERY_FRAMES = 1500       # 每输出多少帧打一条统计（≈12s）
 
 
 class JitterBuffer:
-    """RTP 包环形缓冲区
+    """RTP 乱序重排缓冲（按 seq 排序，容量约 4.6 秒 @ 44100Hz/352spf）"""
 
-    512 条目 (~4.1 秒 @ 44100Hz/352spf)，自动淘汰最旧条目。
-    替代 dict-based jitter_buffer，提供更大的抖动容忍窗口。
-    """
-
-    BUFFER_SIZE = 512
-
-    def __init__(self, max_size: int = BUFFER_SIZE):
+    def __init__(self, max_size: int = 512):
         self._max_size = max_size
-        self._packets: dict[int, tuple[int, bytes]] = {}  # seq -> (timestamp, payload)
-        self._order: deque[int] = deque()  # 插入顺序，用于淘汰
+        self._packets: dict[int, bytes] = {}
+        self._order: deque[int] = deque()
 
-    def insert(self, seq: int, rtp_timestamp: int, payload: bytes) -> None:
-        """插入包。满时淘汰最旧条目。重复 seq 覆盖。"""
+    def insert(self, seq: int, payload: bytes) -> None:
+        """插入音频包；重复 seq 覆盖，满载淘汰最旧的包"""
         if seq in self._packets:
-            self._packets[seq] = (rtp_timestamp, payload)
+            self._packets[seq] = payload
             return
         while len(self._packets) >= self._max_size:
-            old_seq = self._order.popleft()
-            self._packets.pop(old_seq, None)
-        self._packets[seq] = (rtp_timestamp, payload)
+            self._packets.pop(self._order.popleft(), None)
+        self._packets[seq] = payload
         self._order.append(seq)
 
-    def has(self, seq: int) -> bool:
-        return seq in self._packets
-
-    def pop(self, seq: int) -> tuple[int, bytes] | None:
-        """取出并删除指定 seq 的包。"""
-        pkt = self._packets.pop(seq, None)
-        return pkt
-
-    def drain(self, start_seq: int) -> list[tuple[int, int, bytes]]:
-        """从 start_seq 开始按序取出连续的包，遇到缺口停止。
-        返回 [(seq, timestamp, payload), ...]"""
-        result = []
-        seq = start_seq
+    def drain(self, next_seq: int) -> list[bytes]:
+        """从 next_seq 起取出连续可播的包，遇到缺口停止"""
+        payloads = []
+        seq = next_seq
         while seq in self._packets:
-            ts, payload = self._packets.pop(seq)
-            result.append((seq, ts, payload))
+            payloads.append(self._packets.pop(seq))
             seq = (seq + 1) & 0xFFFF
-        return result
+        return payloads
 
     def gap_missing(self, next_seq: int) -> list[int]:
-        """返回 next_seq 到下一个可用包之间的缺失 seq 列表。最多扫描 32 个位置。"""
+        """next_seq 到下一个已到达包之间的缺失 seq（最多扫 32 个）"""
         missing = []
         seq = next_seq
         for _ in range(32):
             if seq in self._packets:
-                break
+                return missing
             missing.append(seq)
             seq = (seq + 1) & 0xFFFF
-        else:
-            # 扫描了 32 个位置都没找到，只返回前几个
-            missing = missing[:8]
-        return missing
+        return missing[:8]
 
     def next_available_after(self, seq: int) -> int | None:
-        """找 seq 之后最近的可用 seq。"""
+        """seq 之后最近的已到达 seq"""
         s = seq
         for _ in range(self._max_size):
             if s in self._packets:
@@ -116,131 +99,31 @@ class JitterBuffer:
     def __len__(self) -> int:
         return len(self._packets)
 
-    def __contains__(self, seq: int) -> bool:
-        return seq in self._packets
+
+@dataclass
+class Retransmit:
+    """单个缺失包的重传状态"""
+    first_seen: float
+    last_request: float
+    attempts: int = 1
 
 
-class PlaybackPacer:
-    """帧释放调度器 — 将 RTP 时间戳映射到本地时钟，控制解码线程的帧释放时机
+def decrypt_packet(key: bytes, iv: bytes, payload: bytes) -> bytes:
+    """FairPlay 的 AES-128-CBC 解密（只解密 16 字节对齐的部分）
 
-    时间锚点由 D4 sync 包 (RTCP TIME_ANNOUNCE) 提供：
-      playAtRtpTimestamp 对应 NTP 时间 → 映射到本地 perf_counter。
-    无锚点时退化为启动缓冲模式（累积 32 帧后立即释放）。
+    注意：pycryptodome 的 CBC cipher 对象是「有状态」的，必须每包新建；
+    复用会让第二个包之后全部解错，表现就是有数据流但完全没声音。
     """
-
-    def __init__(self, sample_rate: int = 44100):
-        self._sample_rate = sample_rate
-        # 锚点: RTP 时间戳 → 本地 perf_counter 时间
-        self._anchor_rtp_ts: int | None = None
-        self._anchor_perf: float = 0.0
-        self._lock = threading.Lock()
-        # 漂移校正: 实际/期望时间比的 EMA
-        self._drift_rate: float = 1.0
-        # 目标延迟: 帧释放提前量，补偿 HTTP 缓冲 + 网络 + 音箱缓冲
-        self._target_latency_sec: float = 0.200
-        # 启动缓冲
-        self._startup_count: int = 0
-        self._startup_target: int = 32  # ~256ms
-        self._started: bool = False
-
-    @property
-    def has_anchor(self) -> bool:
-        return self._anchor_rtp_ts is not None
-
-    def update_anchor(self, sender_rtp_ts: int, ntp_time: float,
-                      play_at_rtp_ts: int) -> None:
-        """从 D4 sync 包更新时间锚点。
-
-        D4 包含义: sender 在 NTP 时间 ntp_time 时，RTP 时钟为 sender_rtp_ts，
-        且 play_at_rtp_ts 对应的音频应该被播放。
-        我们用 play_at_rtp_ts 作为锚点，因为它直接告诉我们「这个 RTP 时间戳
-        应该在什么时刻播放」。
-        """
-        now_perf = time.perf_counter()
-        with self._lock:
-            if self._anchor_rtp_ts is None:
-                # 首次同步: 建立锚点
-                self._anchor_rtp_ts = play_at_rtp_ts
-                self._anchor_perf = now_perf + self._target_latency_sec
-                self._started = False
-                self._startup_count = 0
-            else:
-                # 后续同步: 计算漂移率
-                audio_elapsed = (play_at_rtp_ts - self._anchor_rtp_ts) / self._sample_rate
-                real_elapsed = now_perf - self._anchor_perf
-                if audio_elapsed > 0.5:
-                    measured_rate = real_elapsed / audio_elapsed
-                    # EMA 更新 (alpha=0.05 温和收敛)
-                    self._drift_rate += 0.05 * (measured_rate - self._drift_rate)
-                    # 定期重锚点防止累积误差
-                    self._anchor_rtp_ts = play_at_rtp_ts
-                    self._anchor_perf = now_perf + self._target_latency_sec
-
-    def wait_for_frame(self, rtp_timestamp: int) -> bool:
-        """解码线程调用。等到帧应该释放的时刻。
-        返回 True = 播放，False = 太晚了跳过。
-        """
-        if rtp_timestamp == 0:
-            return True  # 静音帧直接播放
-
-        with self._lock:
-            if self._anchor_rtp_ts is None:
-                # 无锚点: 启动缓冲模式
-                self._startup_count += 1
-                if self._startup_count >= self._startup_target:
-                    self._started = True
-                return True
-
-            # 计算此帧应该释放的时刻
-            audio_offset = (rtp_timestamp - self._anchor_rtp_ts) / self._sample_rate
-            target_perf = self._anchor_perf + audio_offset * self._drift_rate
-
-        now = time.perf_counter()
-        wait_time = target_perf - now
-
-        if wait_time > 0.005:  # 超过 5ms 才 sleep
-            time.sleep(wait_time)
-            return True
-        elif wait_time < -0.100:  # 超过 100ms 过期
-            return False  # 跳过
-        else:
-            return True  # 稍微迟到但可接受
-
-    def reset(self) -> None:
-        """FLUSH 时重置。"""
-        with self._lock:
-            self._anchor_rtp_ts = None
-            self._anchor_perf = 0.0
-            self._drift_rate = 1.0
-            self._startup_count = 0
-            self._started = False
+    aligned = len(payload) & ~0xF
+    if aligned == 0:
+        return payload
+    plain = AES.new(key, AES.MODE_CBC, iv).decrypt(payload[:aligned])
+    return plain + payload[aligned:] if aligned < len(payload) else plain
 
 
-class NTPClockSync:
-    """NTP 时钟同步 — 跟踪本机与 iPhone 的网络延迟"""
-
-    NTP_EPOCH_OFFSET = 2208988800.0  # 1900-01-01 到 1970-01-01 的秒数
-
-    def __init__(self):
-        self._latency_ms: float = 50.0  # 估计的单向延迟 (ms)
-        self._rtt_samples: deque[float] = deque(maxlen=20)
-        self._lock = threading.Lock()
-
-    @property
-    def latency_ms(self) -> float:
-        return self._latency_ms
-
-    def update_latency(self, request_sent_mono: float, response_recv_mono: float) -> None:
-        """从 timing exchange 的往返时间更新延迟估计。"""
-        rtt = response_recv_mono - request_sent_mono
-        if rtt <= 0 or rtt > 1.0:  # 丢弃异常值
-            return
-        with self._lock:
-            self._rtt_samples.append(rtt)
-            if len(self._rtt_samples) >= 3:
-                sorted_rtts = sorted(self._rtt_samples)
-                median_rtt = sorted_rtts[len(sorted_rtts) // 2]
-                self._latency_ms = (median_rtt / 2.0) * 1000.0
+def _as_frames(resampled) -> list:
+    """PyAV 的 resample() 返回单帧或帧列表，统一成列表"""
+    return resampled if isinstance(resampled, list) else [resampled]
 
 
 # AirPort 私钥 (用于 AirPlay 1 RSA 认证)
@@ -385,13 +268,11 @@ class AirPlayServer:
         self._rtp_data_socket: socket.socket | None = None  # RTP 数据 socket（用于注入重传包）
         self._flush_flag = threading.Event()  # FLUSH 请求标志（跨线程通知）
 
-        # 时间同步（新增）
-        self._timing_pacer: PlaybackPacer | None = None
-        self._clock_sync: NTPClockSync | None = None
-        self._timing_client_addr: tuple | None = None  # iPhone timing 端口地址
-        self._timing_socket: socket.socket | None = None
-        self._timing_request_seq: int = 0
         self._rtsp_client_addr: tuple | None = None  # RTSP 客户端 IP
+
+        # RTP 侧诊断统计（丢包/重传/解码失败），卡顿时先看这条日志
+        self._rtp_stats: dict[str, int] = {}
+        self._reset_rtp_stats()
 
     def _generate_device_id(self) -> str:
         """生成设备 MAC 地址格式的 ID
@@ -957,25 +838,22 @@ class AirPlayServer:
     def _handle_setup(self, sock: socket.socket, headers: dict, cseq: str) -> tuple:
         """处理 SETUP 请求
 
-        客户端发送的 Transport 头包含客户端的 control_port 和 timing_port。
-        服务端需要创建自己的三个 UDP socket:
+        客户端在 Transport 头里给出它的 control_port（用于发送重传请求）。
+        服务端创建三个 UDP socket:
         - server_port: 接收 RTP 音频数据
         - control_port: 接收/发送 RTCP 控制包
         - timing_port: 接收/发送 NTP timing 包
         """
         transport = headers.get("Transport", "")
 
-        # 解析 iPhone 的 control_port 和 timing_port
-        client_timing_port = 0
+        # 解析 iPhone 的 control_port（用于发送重传请求）
         client_control_port = 0
         for part in transport.split(";"):
-            part = part.strip()
-            if "timing_port" in part:
-                try: client_timing_port = int(part.split("=")[1])
-                except (ValueError, IndexError): pass
-            elif "control_port" in part:
-                try: client_control_port = int(part.split("=")[1])
-                except (ValueError, IndexError): pass
+            if "control_port" in part:
+                try:
+                    client_control_port = int(part.split("=", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
 
         # 创建 RTP 接收 socket (server_port - 音频数据)
         rtp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -993,40 +871,21 @@ class AirPlayServer:
         control_socket.bind(("0.0.0.0", 0))
         control_port = control_socket.getsockname()[1]
 
-        # 存储 socket 引用，供 RTCP 重传使用
         self._rtcp_control_socket = control_socket
         self._rtp_data_socket = rtp_socket
-
-        # 创建 timing socket (NTP 时间同步)
-        timing_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        timing_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        timing_socket.settimeout(1.0)  # 短超时，timing_loop 内部管理发送间隔
-        timing_socket.bind(("0.0.0.0", 0))
-        timing_port = timing_socket.getsockname()[1]
-
-        # 初始化时间同步对象
-        self._timing_socket = timing_socket
-        self._clock_sync = NTPClockSync()
-        self._timing_pacer = PlaybackPacer(self._sample_rate)
-        if client_timing_port > 0 and self._rtsp_client_addr:
-            self._timing_client_addr = (self._rtsp_client_addr[0], client_timing_port)
         if client_control_port > 0 and self._rtsp_client_addr:
             self._rtcp_control_addr = (self._rtsp_client_addr[0], client_control_port)
 
-        timing_thread = threading.Thread(
-            target=self._timing_loop,
-            args=(timing_socket,),
-            daemon=True,
-        )
-        timing_thread.start()
+        # timing socket：只用来回复 iPhone 的 NTP timing 请求
+        timing_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        timing_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        timing_socket.settimeout(1.0)
+        timing_socket.bind(("0.0.0.0", 0))
+        timing_port = timing_socket.getsockname()[1]
 
-        # 启动 RTCP (control) 接收线程
-        rtcp_thread = threading.Thread(
-            target=self._rtcp_loop,
-            args=(control_socket,),
-            daemon=True,
-        )
-        rtcp_thread.start()
+        # timing 应答线程 + RTCP 控制线程
+        threading.Thread(target=self._timing_loop, args=(timing_socket,), daemon=True).start()
+        threading.Thread(target=self._rtcp_loop, args=(control_socket,), daemon=True).start()
 
         # 构建 Transport 响应 - RAOP 格式
         # server_port = RTP 音频端口, control_port = RTCP 端口, timing_port = NTP 端口
@@ -1072,51 +931,35 @@ class AirPlayServer:
         except Exception as e:
             log.debug(f"RTCP 重传请求失败: {e}")
 
-    def _rtcp_loop(self, rtcp_socket: socket.socket):
-        """RTCP 控制包接收循环
+    def _rtcp_loop(self, rtcp_socket: socket.socket) -> None:
+        """接收 RTCP 控制包
 
-        处理:
-        - TIME_ANNOUNCE (0xd4/212): NTP 时间同步
-        - REXMIT_RESPONSE (0xd6/214): iPhone 返回的重传包，注入 RTP 数据流
+        - 记录 iPhone 的控制端口（发送重传请求用）
+        - REXMIT_RESPONSE (0xd6)：把 iPhone 补发的 RTP 包回灌给接收线程
         """
         log.info("RTCP 线程启动")
         try:
             while self._running:
                 try:
                     data, addr = rtcp_socket.recvfrom(1500)
-                    if not data or len(data) < 4:
-                        continue
-
-                    # 记录 iPhone 控制端口地址（用于发送重传请求）
-                    if not self._rtcp_control_addr:
-                        self._rtcp_control_addr = addr
-
-                    ptype = data[1]
-                    if ptype == 212:  # TIME_ANNOUNCE_NTP (D4 sync 包)
-                        if len(data) >= 20:
-                            sender_rtp_ts = int.from_bytes(data[4:8], 'big')
-                            ntp_sec = int.from_bytes(data[8:12], 'big')
-                            ntp_frac = int.from_bytes(data[12:16], 'big')
-                            ntp_time = ntp_sec + (ntp_frac * 2**-32)
-                            play_at_rtp_ts = int.from_bytes(data[16:20], 'big')
-                            if self._timing_pacer:
-                                self._timing_pacer.update_anchor(
-                                    sender_rtp_ts, ntp_time, play_at_rtp_ts)
-                    elif ptype == 214:  # REXMIT_RESPONSE — iPhone 重传的 RTP 包
-                        # data[4:] 是完整的 RTP 包，注入 RTP 数据 socket
-                        rtp_data = data[4:]
-                        if len(rtp_data) >= 12 and self._rtp_data_socket:
-                            try:
-                                rtp_port = self._rtp_data_socket.getsockname()[1]
-                                self._rtp_data_socket.sendto(rtp_data, ('127.0.0.1', rtp_port))
-                            except Exception as e:
-                                log.debug(f"RTCP 重传包注入失败: {e}")
                 except socket.timeout:
                     continue
                 except OSError:
                     break
-        except Exception as e:
-            pass
+                if len(data) < 4:
+                    continue
+                if self._rtcp_control_addr is None:
+                    self._rtcp_control_addr = addr
+                if data[1] != 214 or not self._rtp_data_socket:
+                    continue
+                packet = data[4:]
+                if len(packet) < _RTP_HEADER_LEN:
+                    continue
+                try:
+                    port = self._rtp_data_socket.getsockname()[1]
+                    self._rtp_data_socket.sendto(packet, ("127.0.0.1", port))
+                except OSError as e:
+                    log.debug(f"重传包注入失败: {e}")
         finally:
             rtcp_socket.close()
             log.info("RTCP 线程已停止")
@@ -1136,114 +979,65 @@ class AirPlayServer:
             "RTP-Info": f"seq={self._last_rtp_seq};rtptime={self._last_rtp_timestamp}",
         })
 
-    def _timing_loop(self, timing_socket: socket.socket):
-        """双向 NTP 时间同步循环
+    def _timing_loop(self, timing_socket: socket.socket) -> None:
+        """回复 iPhone 的 NTP timing 请求（0x52 → 0x53）
 
-        - 响应 iPhone 的 0x52 timing 请求（原有逻辑）
-        - 主动向 iPhone 发送 0x52 timing 请求（每 3 秒一次，前 3 次 300ms 间隔）
-        - 从 0x53 响应计算 RTT，更新 NTPClockSync 延迟估计
+        RAOP 只要求接收端应答 timing。本机不做时钟对齐：音频按到达顺序解码
+        输出，由音箱按实时速率拉流。
         """
-        NTP_EPOCH = NTPClockSync.NTP_EPOCH_OFFSET
-        # 发送间隔: 前 3 次 300ms（快速收敛），之后 3 秒
-        _fast_pings_left = 3
-        _fast_interval = 0.3
-        _normal_interval = 3.0
-        _last_send_time = 0.0
-        _pending_seq: int | None = None
-        _send_mono: float = 0.0
-
         try:
             while self._running:
-                # --- 主动发送 timing request ---
-                now = time.time()
-                client_addr = self._timing_client_addr
-                interval = _fast_interval if _fast_pings_left > 0 else _normal_interval
-                if client_addr and (now - _last_send_time) >= interval:
-                    self._timing_request_seq = (self._timing_request_seq + 1) & 0xFFFF
-                    _pending_seq = self._timing_request_seq
-                    _send_mono = time.perf_counter()
-
-                    req = bytearray(32)
-                    req[0] = 0x80
-                    req[1] = 0x52  # TIME_REQUEST
-                    req[2:4] = self._timing_request_seq.to_bytes(2, 'big')
-                    # bytes 24-31: our send time as NTP timestamp
-                    ntp_now = now + NTP_EPOCH
-                    ntp_sec = int(ntp_now)
-                    ntp_frac = int((ntp_now - ntp_sec) * (2**32))
-                    req[24:28] = ntp_sec.to_bytes(4, 'big')
-                    req[28:32] = ntp_frac.to_bytes(4, 'big')
-
-                    try:
-                        timing_socket.sendto(bytes(req), client_addr)
-                        if _fast_pings_left > 0:
-                            _fast_pings_left -= 1
-                    except Exception:
-                        pass
-                    _last_send_time = now
-
-                # --- 接收并处理包 ---
                 try:
                     data, addr = timing_socket.recvfrom(256)
                 except socket.timeout:
                     continue
-                if not data or len(data) < 32:
+                except OSError:
+                    break
+                if len(data) < 32 or (data[1] & 0x7F) != 0x52:
                     continue
 
-                ptype = data[1] & 0x7f
+                ntp_now = time.time() + NTP_EPOCH_OFFSET
+                ntp_sec = int(ntp_now)
+                ntp_frac = int((ntp_now - ntp_sec) * (2 ** 32))
 
-                if ptype == 0x52:
-                    # iPhone 发来 timing request → 回复 response
-                    recv_now = time.time()
-                    ntp_recv = recv_now + NTP_EPOCH
-                    ntp_sec = int(ntp_recv)
-                    ntp_frac = int((ntp_recv - ntp_sec) * (2**32))
-
-                    response = bytearray(32)
-                    response[0] = 0x80
-                    response[1] = 0xd3  # timing response (0x53 | marker)
-                    response[2:4] = data[2:4]  # 复制 sequence number
-                    response[4:12] = data[24:32]  # 复制 reference send time
-                    response[12:16] = ntp_sec.to_bytes(4, 'big')
-                    response[16:20] = ntp_frac.to_bytes(4, 'big')
-                    send_now = time.time() + NTP_EPOCH
-                    send_sec = int(send_now)
-                    send_frac = int((send_now - send_sec) * (2**32))
-                    response[20:24] = send_sec.to_bytes(4, 'big')
-                    response[24:28] = send_frac.to_bytes(4, 'big')
-
-                    timing_socket.sendto(bytes(response), addr)
-
-                elif ptype == 0x53:
-                    # iPhone 回复 timing response → 计算 RTT
-                    resp_seq = (data[2] << 8) | data[3]
-                    if _pending_seq is not None and resp_seq == _pending_seq:
-                        recv_mono = time.perf_counter()
-                        if self._clock_sync:
-                            self._clock_sync.update_latency(_send_mono, recv_mono)
-                        _pending_seq = None
-
-        except Exception:
-            pass
+                reply = bytearray(32)
+                reply[0] = 0x80
+                reply[1] = 0xD3             # timing response
+                reply[2:4] = data[2:4]      # 回显 sequence
+                reply[4:12] = data[24:32]   # 回显请求方的发送时间
+                reply[12:16] = ntp_sec.to_bytes(4, "big")   # 收到时间
+                reply[16:20] = ntp_frac.to_bytes(4, "big")
+                reply[20:24] = ntp_sec.to_bytes(4, "big")   # 回发时间
+                reply[24:28] = ntp_frac.to_bytes(4, "big")
+                try:
+                    timing_socket.sendto(bytes(reply), addr)
+                except OSError:
+                    pass
+        except Exception as e:
+            log.debug(f"timing 线程异常: {e}")
         finally:
             timing_socket.close()
 
-    def _rtp_receive_loop(self, rtp_socket: socket.socket):
-        """RTP 音频数据接收循环 — 两阶段管道 + 时间调度
+    def _reset_rtp_stats(self) -> None:
+        self._rtp_stats = dict.fromkeys(
+            ("lost", "retransmit", "decrypt_failed", "decode_failed", "queue_full"), 0
+        )
 
-        Stage 1 (receiver): recvfrom → 环形缓冲区 → 按序发送到解码队列
-        Stage 2 (decoder):  解码队列 → PlaybackPacer 调度 → 解密 → ALAC 解码 → write_pcm
+    def _rtp_receive_loop(self, rtp_socket: socket.socket) -> None:
+        """RTP 音频接收：收包/重排/补包 与 解密/解码 分两个线程
 
-        接收线程只做 UDP 读取和轻量操作，永远不被解码阻塞。
+        接收线程只做 UDP 读取和顺序整理，永不等待解码；解码线程按顺序把 PCM
+        写入 HTTP 音频流。整条链路不做墙上时钟调度 —— 音箱自己按实时速率拉流，
+        这里只需要保证「不断流、不丢帧」。
         """
         log.info("RTP 接收线程启动")
+        self._reset_rtp_stats()
 
-        # 等待流媒体激活
-        wait_count = 0
-        while self._running and not self._stream_server._active and wait_count < 50:
+        # 等 RECORD：流媒体激活后才开始收包
+        for _ in range(50):
+            if not self._running or self._stream_server._active:
+                break
             time.sleep(0.1)
-            wait_count += 1
-
         if not self._stream_server._active:
             log.warning("RTP: 流媒体未激活，退出接收线程")
             rtp_socket.close()
@@ -1251,196 +1045,104 @@ class AirPlayServer:
 
         log.info("RTP: 开始接收音频数据")
 
-        # 预计算常用值
-        _session_key = self._session_key
-        _session_iv16 = self._session_iv16
-        _write_pcm = self._stream_server.write_pcm
-        _decode_audio = self._decode_audio
-        _silence_frame = self._silence_frame
-        _recv_buf = bytearray(2048)
-
-        # 解码队列
-        decode_queue: queue.Queue[PacketData | None] = queue.Queue(maxsize=200)
+        session_key = self._session_key
+        session_iv = self._session_iv16
+        write_pcm = self._stream_server.write_pcm
+        silence = self._silence_frame
+        decode_audio = self._decode_audio
+        stats = self._rtp_stats
+        recv_buf = bytearray(2048)
+        decode_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=_DECODE_QUEUE_MAX)
         running = True
 
-        # ---- Stage 2: 解码线程（带 pacer 调度） ----
-        def _decoder_worker():
-            _pacer = self._timing_pacer
+        def _decoder() -> None:
+            """解码线程：空 payload = 补一帧静音，None = 结束"""
+            frames = 0
             try:
                 while running:
                     try:
-                        item = decode_queue.get(timeout=0.5)
+                        payload = decode_queue.get(timeout=0.5)
                     except queue.Empty:
                         continue
-                    if item is None:
+                    if payload is None:
                         break
-
-                    # 时间调度: 等到正确时刻再释放帧
-                    if _pacer and item.timestamp > 0:
-                        if not _pacer.wait_for_frame(item.timestamp):
-                            continue  # 太晚了，跳过
-
-                    # 静音帧直接写入
-                    if item.seq == -1:
-                        _write_pcm(item.payload)
+                    if not payload:
+                        write_pcm(silence)
                         continue
-
-                    # 解密
-                    payload = item.payload
-                    if _session_key and _session_iv16:
+                    if session_key and session_iv:
                         try:
-                            plen = len(payload)
-                            decrypt_len = plen & ~0xF
-                            if decrypt_len > 0:
-                                cipher = AES.new(_session_key, AES.MODE_CBC, _session_iv16)
-                                decrypted = cipher.decrypt(payload[:decrypt_len])
-                                if decrypt_len < plen:
-                                    decrypted = decrypted + bytes(memoryview(payload)[decrypt_len:])
-                                payload = decrypted
+                            payload = decrypt_packet(session_key, session_iv, payload)
                         except Exception:
-                            _write_pcm(_silence_frame)
+                            stats["decrypt_failed"] += 1
+                            write_pcm(silence)
                             continue
+                    pcm = decode_audio(payload)
+                    if pcm is None:
+                        stats["decode_failed"] += 1
+                        pcm = silence
+                    write_pcm(pcm)
 
-                    # 解码并输出
-                    decoded = _decode_audio(payload)
-                    if decoded:
-                        _write_pcm(decoded)
+                    frames += 1
+                    if frames >= _STATS_EVERY_FRAMES:
+                        frames = 0
+                        self._log_audio_stats(decode_queue)
             except Exception as e:
                 log.error(f"RTP 解码线程异常: {e}")
 
-        decoder_thread = threading.Thread(target=_decoder_worker, daemon=True)
-        decoder_thread.start()
+        threading.Thread(target=_decoder, daemon=True).start()
 
-        # ---- Stage 1: 接收 + 环形缓冲 + 指数退避重传 ----
         try:
-            jb = JitterBuffer(max_size=512)
+            jb = JitterBuffer()
+            pending: dict[int, Retransmit] = {}
             next_seq = -1
-            _pacer = self._timing_pacer
-
-            # 启动缓冲
-            STARTUP_BUFFER_TARGET = 32  # ~256ms @ 44100Hz/352spf
-            startup_buffered = False
-
-            # 重传状态: seq -> (首次请求 perf_counter 时间, 重试次数)
-            _retransmit_state: dict[int, tuple[float, int]] = {}
-            _RETRANSMIT_BASE_INTERVAL = 0.040  # 40ms
-            _RETRANSMIT_MAX_INTERVAL = 1.000
-            _RETRANSMIT_GIVE_UP_TIME = 2.0  # 2秒后放弃
+            prebuffered = False
 
             while self._running:
                 try:
-                    nbytes, addr = rtp_socket.recvfrom_into(_recv_buf)
-                    if nbytes < 12:
-                        continue
-
-                    seq = (_recv_buf[2] << 8) | _recv_buf[3]
-                    rtp_timestamp = (_recv_buf[4] << 24) | (_recv_buf[5] << 16) | \
-                                   (_recv_buf[6] << 8) | _recv_buf[7]
-                    payload = bytes(_recv_buf[12:nbytes])
-
-                    # 跟踪最新 RTP 状态（供 FLUSH/RECORD 响应使用）
-                    self._last_rtp_seq = seq
-                    self._last_rtp_timestamp = rtp_timestamp
-
-                    if next_seq == -1:
-                        next_seq = seq
-
-                    # 插入环形缓冲区
-                    jb.insert(seq, rtp_timestamp, payload)
-
-                    # 启动预缓冲: 等待足够帧数
-                    if not startup_buffered:
-                        if len(jb) < STARTUP_BUFFER_TARGET:
-                            continue
-                        # 等待 pacer 锚点（如果还没收到 D4 sync）
-                        if _pacer and not _pacer.has_anchor:
-                            if len(jb) < STARTUP_BUFFER_TARGET * 2:
-                                continue
-                        startup_buffered = True
-
-                    # 检查 FLUSH 请求
-                    if self._flush_flag.is_set():
-                        self._flush_flag.clear()
-                        jb.clear()
-                        next_seq = seq
-                        _retransmit_state.clear()
-                        if _pacer:
-                            _pacer.reset()
-                        continue
-
-                    # 按序 drain 到解码队列
-                    drained = jb.drain(next_seq)
-                    for d_seq, d_ts, d_payload in drained:
-                        try:
-                            decode_queue.put_nowait(PacketData(d_seq, d_ts, d_payload))
-                        except queue.Full:
-                            pass
-                    if drained:
-                        next_seq = (drained[-1][0] + 1) & 0xFFFF
-                        for d_seq, _, _ in drained:
-                            _retransmit_state.pop(d_seq, None)
-
-                    # 丢包检测 + 指数退避重传
-                    if len(jb) > 8:
-                        missing_seqs = jb.gap_missing(next_seq)
-                        now_mono = time.perf_counter()
-
-                        for missing_seq in missing_seqs:
-                            if missing_seq in _retransmit_state:
-                                first_time, retry_count = _retransmit_state[missing_seq]
-                                # 放弃条件
-                                if now_mono - first_time > _RETRANSMIT_GIVE_UP_TIME:
-                                    _retransmit_state.pop(missing_seq, None)
-                                    next_avail = jb.next_available_after(missing_seq)
-                                    if next_avail is not None:
-                                        gap = (next_avail - missing_seq) & 0xFFFF
-                                        gap = min(gap, 64)
-                                        for _ in range(gap):
-                                            try:
-                                                decode_queue.put_nowait(
-                                                    PacketData(-1, 0, _silence_frame))
-                                            except queue.Full:
-                                                pass
-                                        next_seq = next_avail
-                                        # 清理跳过范围的重传状态
-                                        for s in range(missing_seq, next_avail):
-                                            _retransmit_state.pop(s & 0xFFFF, None)
-                                    continue
-
-                                # 指数退避重试
-                                backoff = min(
-                                    _RETRANSMIT_BASE_INTERVAL * (2 ** retry_count),
-                                    _RETRANSMIT_MAX_INTERVAL
-                                )
-                                if now_mono - first_time >= backoff * (retry_count + 1):
-                                    self._request_retransmit(missing_seq, 1)
-                                    _retransmit_state[missing_seq] = (first_time, retry_count + 1)
-                                    try:
-                                        decode_queue.put_nowait(
-                                            PacketData(-1, 0, _silence_frame))
-                                    except queue.Full:
-                                        pass
-                            else:
-                                # 首次检测: 请求重传
-                                self._request_retransmit(missing_seq, 1)
-                                _retransmit_state[missing_seq] = (now_mono, 1)
-                                try:
-                                    decode_queue.put_nowait(
-                                        PacketData(-1, 0, _silence_frame))
-                                except queue.Full:
-                                    pass
-
+                    nbytes, _addr = rtp_socket.recvfrom_into(recv_buf)
                 except socket.timeout:
                     continue
                 except OSError:
                     break
+                if nbytes <= _RTP_HEADER_LEN:   # 只有头没有负载的包直接丢掉
+                    continue
 
+                seq = (recv_buf[2] << 8) | recv_buf[3]
+                self._last_rtp_seq = seq
+                self._last_rtp_timestamp = int.from_bytes(recv_buf[4:8], "big")
+                if next_seq < 0:
+                    next_seq = seq
+                jb.insert(seq, bytes(recv_buf[_RTP_HEADER_LEN:nbytes]))
+
+                if not prebuffered:
+                    if len(jb) < _PREBUFFER_PACKETS:
+                        continue
+                    prebuffered = True
+
+                if self._flush_flag.is_set():
+                    # FLUSH：丢掉旧数据，从当前包重新开始
+                    self._flush_flag.clear()
+                    jb.clear()
+                    pending.clear()
+                    next_seq = seq
+                    continue
+
+                start = next_seq
+                drained = jb.drain(start)
+                if drained:
+                    next_seq = (start + len(drained)) & 0xFFFF
+                    for offset, payload in enumerate(drained):
+                        pending.pop((start + offset) & 0xFFFF, None)
+                        try:
+                            decode_queue.put_nowait(payload)
+                        except queue.Full:
+                            stats["queue_full"] += 1
+
+                next_seq = self._recover_gaps(jb, next_seq, pending, decode_queue)
         except Exception as e:
             log.error(f"RTP 接收错误: {e}")
         finally:
             running = False
-            if self._timing_pacer:
-                self._timing_pacer.reset()
             try:
                 decode_queue.put_nowait(None)
             except queue.Full:
@@ -1448,33 +1150,75 @@ class AirPlayServer:
             rtp_socket.close()
             log.info("RTP 接收线程结束")
 
+    def _recover_gaps(self, jb: JitterBuffer, next_seq: int,
+                      pending: dict[int, Retransmit], decode_queue) -> int:
+        """为缺失的包请求重传；重传窗口过后补静音并跳过（返回新的 next_seq）"""
+        if len(jb) <= _GAP_DETECT_MIN:
+            return next_seq
+
+        stats = self._rtp_stats
+        now = time.perf_counter()
+        for seq in jb.gap_missing(next_seq):
+            state = pending.get(seq)
+            if state is None:
+                pending[seq] = Retransmit(now, now)
+                self._request_retransmit(seq, 1)
+                stats["retransmit"] += 1
+                continue
+
+            if now - state.first_seen > _RETRANSMIT_GIVE_UP:
+                # 补不回来了：用静音占位跳过空洞，否则后续音频会被整体堵住
+                pending.pop(seq, None)
+                following = jb.next_available_after(seq)
+                if following is None:
+                    continue
+                missing = min((following - seq) & 0xFFFF, _MAX_GAP_FILL)
+                for _ in range(missing):
+                    try:
+                        decode_queue.put_nowait(b"")
+                    except queue.Full:
+                        stats["queue_full"] += 1
+                        break
+                stats["lost"] += missing
+                for skipped in range(seq, following):
+                    pending.pop(skipped & 0xFFFF, None)
+                return following
+
+            interval = min(_RETRANSMIT_INTERVAL * (1 << state.attempts),
+                           _RETRANSMIT_MAX_INTERVAL)
+            if now - state.last_request >= interval:
+                self._request_retransmit(seq, 1)
+                state.last_request = now
+                state.attempts += 1
+                stats["retransmit"] += 1
+        return next_seq
+
+    def _log_audio_stats(self, decode_queue) -> None:
+        s = self._rtp_stats
+        log.info(
+            f"[音频统计] {self._stream_server.stats_line()} "
+            f"解码队列={decode_queue.qsize()} 丢包={s['lost']} 重传={s['retransmit']} "
+            f"解密失败={s['decrypt_failed']} 解码失败={s['decode_failed']} "
+            f"队列溢出={s['queue_full']}"
+        )
+
     def _decode_audio(self, data: bytes) -> bytes | None:
-        """解码音频数据为 PCM"""
+        """ALAC/AAC → 16bit 立体声 PCM；解码失败返回 None"""
         if not self._codec_context:
             return data
-
-        silence = self._silence_frame
-
         try:
-            packet = av.packet.Packet(data)
-            frames = self._codec_context.decode(packet)
-            if not frames:
-                return silence
-
-            ch2 = self._channels * 2
-            parts = []
-            for frame in frames:
-                resampled = self._resampler.resample(frame)
-                if isinstance(resampled, list):
-                    for f in resampled:
-                        mv = memoryview(f.planes[0])
-                        parts.append(bytes(mv[:f.samples * ch2]))
-                else:
-                    mv = memoryview(resampled.planes[0])
-                    parts.append(bytes(mv[:resampled.samples * ch2]))
-            return b"".join(parts) if parts else silence
+            frames = self._codec_context.decode(av.packet.Packet(data))
         except Exception:
-            return silence
+            return None
+        if not frames:
+            return None
+        frame_bytes = self._channels * 2
+        parts = [
+            bytes(memoryview(frame.planes[0])[: frame.samples * frame_bytes])
+            for chunk in frames
+            for frame in _as_frames(self._resampler.resample(chunk))
+        ]
+        return b"".join(parts) if parts else None
 
     def _send_rtsp_response(self, sock: socket.socket, code: int, cseq: str, headers: dict | None = None):
         """发送 RTSP 响应"""
